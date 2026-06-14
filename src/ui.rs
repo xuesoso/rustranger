@@ -222,6 +222,7 @@ const HELP: &[&str] = &[
     "Bookmarks & tags",
     "  m{key}            set bookmark",
     "  `{key} / '{key}   go to bookmark",
+    "  um{key}           delete bookmark  (:clearbookmarks clears all)",
     "  t                 toggle tag on selection",
     "",
     "View, search & console",

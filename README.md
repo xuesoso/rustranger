@@ -57,7 +57,8 @@ Python plugin system, `scope.sh` and external preview helpers, multipane view.
 | `gn` | new tab | `D` | delete (with confirm) |
 | `Alt-1`..`9` | go to tab N | `cw` | rename |
 | `t` | toggle tag | `/` then `n`/`N` | search / next / prev |
-| `m`*x* / `` ` ``*x* | set / go to bookmark *x* | `o` | sort menu (see below) |
+| `m`*x* / `` ` ``*x* | set / go to bookmark *x* | `um`*x* | delete bookmark *x* |
+| `o` | sort menu (see below) | `:clearbookmarks` | clear all bookmarks |
 | `:` | command console | `q` / `Q` | close tab / quit all |
 | `?` | help (scrollable key list) | | |
 
@@ -75,7 +76,7 @@ ascending, the SHIFTed uppercase key sorts descending** (ranger's convention):
 
 `cd`, `mkdir`, `touch`, `rename`, `delete`, `chmod <octal>`, `filter <text>`,
 `search <text>`, `set <option> <value>`, `shell <cmd>`, `open_with <program>`,
-`pager`, `q` / `quit`, `qa` / `quitall`.
+`pager`, `delbookmark <key>`, `clearbookmarks`, `q` / `quit`, `qa` / `quitall`.
 
 ## Configuration
 

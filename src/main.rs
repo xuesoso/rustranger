@@ -21,6 +21,10 @@ use crossterm::{cursor, execute};
 
 use app::App;
 
+/// Internal pending-key sentinel for the `um{key}` chord (awaiting the bookmark
+/// key to delete). Not a typeable key, so it never collides with a real prefix.
+const UNBOOKMARK_PENDING: char = '\u{1}';
+
 struct Args {
     start: PathBuf,
     /// File-picker mode: write the chosen file's path here and exit.
@@ -338,13 +342,18 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
                     'h' => app.paste_hardlinks(),
                     _ => {}
                 },
-                'u' => {
-                    if c == 'v' {
-                        app.clear_marks()
+                'u' => match c {
+                    'v' => app.clear_marks(),
+                    'm' => {
+                        // um{key}: delete a bookmark — await its key, showing the list.
+                        *pending = Some(UNBOOKMARK_PENDING);
+                        app.menu = Some(app.bookmark_menu("delete bookmark"));
                     }
-                }
+                    _ => {}
+                },
                 'm' => app.set_bookmark(c),
                 '`' | '\'' => app.enter_bookmark(c),
+                p if p == UNBOOKMARK_PENDING => app.delete_bookmark(c),
                 'c'
                     if c == 'w' => {
                         // cw: rename, pre-filled with the current name.
@@ -383,11 +392,11 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
         (KeyCode::Char('t'), false) => app.toggle_tag(),
         (KeyCode::Char('m'), false) => {
             *pending = Some('m');
-            app.menu = Some(app.bookmark_menu(true));
+            app.menu = Some(app.bookmark_menu("set bookmark"));
         }
         (KeyCode::Char('`'), false) | (KeyCode::Char('\''), false) => {
             *pending = Some('`');
-            app.menu = Some(app.bookmark_menu(false));
+            app.menu = Some(app.bookmark_menu("go to bookmark"));
         }
         (KeyCode::Char('j'), false) | (KeyCode::Down, false) => app.move_cursor(n as isize),
         (KeyCode::Char('k'), false) | (KeyCode::Up, false) => app.move_cursor(-(n as isize)),

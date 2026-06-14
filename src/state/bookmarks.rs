@@ -40,9 +40,16 @@ impl Bookmarks {
         self.map.get(&key)
     }
 
-    #[allow(dead_code)]
     pub fn delete(&mut self, key: char) {
         if self.map.remove(&key).is_some() {
+            self.save();
+        }
+    }
+
+    /// Remove every bookmark.
+    pub fn clear(&mut self) {
+        if !self.map.is_empty() {
+            self.map.clear();
             self.save();
         }
     }

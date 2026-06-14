@@ -104,7 +104,7 @@ impl KeyMenu {
 
     /// The `u` (un-) menu.
     pub fn un() -> KeyMenu {
-        KeyMenu::from_static("un-", &[("v", "clear marks")])
+        KeyMenu::from_static("un-", &[("v", "clear marks"), ("m", "delete bookmark")])
     }
 
     /// The `c` (change) menu.
@@ -682,9 +682,9 @@ impl App {
 
     // ---- bookmarks --------------------------------------------------------
 
-    /// Build the hint menu listing current bookmarks (shown after `m` or `` ` ``).
-    pub fn bookmark_menu(&self, setting: bool) -> KeyMenu {
-        let title = if setting { "set bookmark" } else { "go to bookmark" };
+    /// Build the hint menu listing current bookmarks (shown after `m`, `` ` ``, or
+    /// `um`). `title` labels the action (set / go to / delete).
+    pub fn bookmark_menu(&self, title: &str) -> KeyMenu {
         let mut items: Vec<(String, String)> = self
             .bookmarks
             .map
@@ -718,10 +718,18 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
     pub fn delete_bookmark(&mut self, key: char) {
-        self.bookmarks.delete(key);
-        self.message = Some(format!("bookmark '{}' deleted", key));
+        if self.bookmarks.get(key).is_some() {
+            self.bookmarks.delete(key);
+            self.message = Some(format!("bookmark '{}' deleted", key));
+        } else {
+            self.message = Some(format!("no bookmark '{}'", key));
+        }
+    }
+
+    pub fn clear_bookmarks(&mut self) {
+        self.bookmarks.clear();
+        self.message = Some("bookmarks cleared".to_string());
     }
 
     // ---- tags -------------------------------------------------------------
@@ -806,6 +814,11 @@ impl App {
             "rename" | "mv" => self.cmd_rename(arg),
             "delete" => self.request_delete(),
             "chmod" => self.cmd_chmod(arg),
+            "clearbookmarks" => self.clear_bookmarks(),
+            "delbookmark" => match arg.chars().next() {
+                Some(key) => self.delete_bookmark(key),
+                None => self.message = Some("delbookmark: a bookmark key is required".to_string()),
+            },
             "filter" => self.cmd_filter(arg),
             "set" => self.cmd_set(arg),
             "search" => {
