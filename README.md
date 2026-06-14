@@ -157,6 +157,32 @@ Bookmarks persist under `$XDG_DATA_HOME/rustranger/bookmarks`. Tags (`t`) are
 in-session only and are not written to disk. File opening uses `$VISUAL`/`$EDITOR`
 for text and `xdg-open` (`open` on macOS) otherwise; `:shell` uses `$SHELL`.
 
+### Open files by extension
+
+Map a file extension to the program that should open it with an `[open]` section.
+Commands run **without a shell** (via `execvp`), so the same config works on Linux
+and macOS:
+
+```toml
+[open]
+csv  = "rustidata"           # foreground: suspends the TUI (terminal apps)
+tsv  = "rustidata"
+md   = "glow -p"             # runs `glow -p <file>`
+zip  = "unzip -l {}"         # {} is replaced by the file path (else appended)
+pdf  = "zathura &"           # trailing & runs it detached (GUI apps)
+html = "firefox &"
+```
+
+- The key is the extension (case-insensitive, no leading dot).
+- The file path is appended as the last argument, unless the command contains a
+  `{}` placeholder, which is substituted with the path.
+- A trailing `&` token runs the program **detached** (the browser stays up) — use
+  it for GUI apps. Without it the program runs in the **foreground**, suspending
+  the TUI until it exits — correct for terminal apps, pagers, editors, or another
+  `rustranger`.
+- A matching `[open]` entry takes priority; files with no entry fall back to the
+  built-in `$EDITOR` / `xdg-open` behavior.
+
 ## Development
 
 The crate is split into a library (`src/lib.rs`) and a thin binary

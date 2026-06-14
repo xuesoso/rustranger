@@ -94,6 +94,10 @@ pub struct Settings {
     pub wrap_scroll: bool,
     /// Names matching this are treated as hidden (in addition to dotfiles).
     pub hidden_filter_dotfiles: bool,
+    /// Per-extension open commands from the `[open]` config section: pairs of
+    /// (lowercased extension without dot, command template). Looked up when
+    /// opening a file before the built-in `$EDITOR`/`xdg-open` fallback.
+    pub openers: Vec<(String, String)>,
 }
 
 impl Settings {
@@ -123,7 +127,8 @@ impl Settings {
                 }
             }
         }
-        // Pass 2: all settings (the theme name is already applied) + [theme] roles.
+        // Pass 2: all settings (the theme name is already applied) + [theme] roles
+        // + [open] per-extension open commands.
         for (section, key, value) in toml_entries(text) {
             match section {
                 "settings" if key != "theme" => self.set_field(key, value),
@@ -132,8 +137,26 @@ impl Settings {
                         self.theme.set_field(key, c);
                     }
                 }
+                "open" => self.set_opener(key, value),
                 _ => {}
             }
+        }
+    }
+
+    /// Register a per-extension open command (from the `[open]` section). The
+    /// extension is normalized to lowercase without a leading dot, so both
+    /// `csv = ...` and `.CSV = ...` map the same files. A later entry for the
+    /// same extension replaces an earlier one.
+    pub fn set_opener(&mut self, ext: &str, cmd: &str) {
+        let ext = ext.trim().trim_start_matches('.').to_lowercase();
+        let cmd = cmd.trim().to_string();
+        if ext.is_empty() || cmd.is_empty() {
+            return;
+        }
+        if let Some(slot) = self.openers.iter_mut().find(|(e, _)| *e == ext) {
+            slot.1 = cmd;
+        } else {
+            self.openers.push((ext, cmd));
         }
     }
 
@@ -206,7 +229,8 @@ fn strip_comment(line: &str) -> &str {
 }
 
 /// Iterate `(section, key, value)` triples from a flat TOML body. `section` is one
-/// of "settings", "theme", or "" (unknown); comments (`#`) and blanks are skipped.
+/// of "settings", "theme", "open", or "" (unknown); comments (`#`) and blanks are
+/// skipped.
 fn toml_entries(text: &str) -> impl Iterator<Item = (&'static str, &str, &str)> {
     let mut section: &'static str = "";
     text.lines().filter_map(move |raw| {
@@ -218,6 +242,7 @@ fn toml_entries(text: &str) -> impl Iterator<Item = (&'static str, &str, &str)> 
             section = match line {
                 "[settings]" => "settings",
                 "[theme]" => "theme",
+                "[open]" => "open",
                 _ => "",
             };
             return None;
@@ -273,6 +298,20 @@ theme = \"default\"              # default|gruvbox-dark|gruvbox-light|solarized-
 # dir = \"#ff8800\"
 # accent = \"cyan\"
 # bg = \"#11131a\"
+
+# Per-extension open commands (override the built-in $EDITOR / xdg-open default).
+# Key = file extension (case-insensitive, no dot). Value = a command run WITHOUT
+# a shell (so it works the same on macOS and Linux):
+#   - the file path is appended as the last argument, or substituted for `{}`
+#   - a trailing `&` runs the program detached (for GUI apps); otherwise it runs
+#     in the foreground, suspending the TUI (for terminal apps / pagers / editors)
+# [open]
+# csv = \"rustidata\"
+# tsv = \"rustidata\"
+# md  = \"glow -p\"
+# zip = \"unzip -l {}\"
+# pdf = \"zathura &\"
+# html = \"firefox &\"
 ";
 
 /// Outcome of generating the default config file.
@@ -318,6 +357,7 @@ impl Default for Settings {
             confirm_on_delete: true,
             wrap_scroll: false,
             hidden_filter_dotfiles: true,
+            openers: Vec::new(),
         }
     }
 }
@@ -360,6 +400,22 @@ mod tests {
         assert!(matches!(s.size_format, SizeFormat::Human));
         // theme = "default" keeps the terminal background.
         assert!(matches!(s.theme.bg, Color::Reset));
+    }
+
+    #[test]
+    fn open_section_maps_extensions_normalized() {
+        fn find<'a>(s: &'a Settings, ext: &str) -> Option<&'a str> {
+            s.openers.iter().find(|(e, _)| e == ext).map(|(_, c)| c.as_str())
+        }
+        let mut s = Settings::default();
+        s.apply_toml("[open]\ncsv = \"rustranger\"\n.TSV = \"rustranger\"\npdf = \"zathura &\"\n");
+        assert_eq!(find(&s, "csv"), Some("rustranger"));
+        assert_eq!(find(&s, "tsv"), Some("rustranger")); // ".TSV" normalized to "tsv"
+        assert_eq!(find(&s, "pdf"), Some("zathura &")); // value (incl. trailing &) preserved
+        // A later entry for the same extension replaces an earlier one.
+        s.apply_toml("[open]\ncsv = \"libreoffice --calc &\"\n");
+        assert_eq!(find(&s, "csv"), Some("libreoffice --calc &"));
+        assert_eq!(s.openers.iter().filter(|(e, _)| e == "csv").count(), 1);
     }
 
     #[test]

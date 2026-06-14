@@ -348,7 +348,7 @@ impl App {
             self.quit = true;
             return;
         }
-        self.pending_run = Some(opener::open_file(path, self.cwd()));
+        self.pending_run = Some(opener::open_file(path, self.cwd(), &self.settings.openers));
     }
 
     /// Go to the parent directory, keeping the cursor on the directory we left.

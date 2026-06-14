@@ -21,7 +21,13 @@ const TEXT_NAMES: &[&str] = &[
     ".bashrc", ".zshrc", ".profile", ".gitconfig", ".vimrc",
 ];
 
-pub fn open_file(path: &Path, cwd: PathBuf) -> RunRequest {
+/// Decide how to open `path`. A user-configured `[open]` entry for the file's
+/// extension wins; otherwise text files open in `$EDITOR` and everything else
+/// goes to the platform opener (`xdg-open`, or `open` on macOS).
+pub fn open_file(path: &Path, cwd: PathBuf, openers: &[(String, String)]) -> RunRequest {
+    if let Some(cmd) = user_opener(path, openers) {
+        return build_command(cmd, path, cwd);
+    }
     if is_text(path) {
         let editor = editor_cmd();
         let mut argv = editor;
@@ -38,6 +44,49 @@ pub fn open_file(path: &Path, cwd: PathBuf) -> RunRequest {
             cwd,
         }
     }
+}
+
+/// The configured command for `path`'s extension, if any (case-insensitive).
+fn user_opener<'a>(path: &Path, openers: &'a [(String, String)]) -> Option<&'a str> {
+    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    openers
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, cmd)| cmd.as_str())
+}
+
+/// Build a run request from a user command template. Tokens are split on
+/// whitespace (no shell is involved, so this behaves identically on macOS and
+/// Linux). Conventions:
+///   - a trailing `&` token runs the program detached and keeps the TUI up (for
+///     GUI apps); without it the program runs in the foreground, suspending the
+///     TUI (correct for terminal apps like editors, pagers, or rustranger);
+///   - a `{}` token is replaced by the file path; if there is no `{}`, the path
+///     is appended as the final argument.
+fn build_command(cmd: &str, path: &Path, cwd: PathBuf) -> RunRequest {
+    let mut tokens: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+    let block = if tokens.last().map(|t| t == "&").unwrap_or(false) {
+        tokens.pop();
+        false
+    } else {
+        true
+    };
+
+    let p = path.to_string_lossy().into_owned();
+    let mut argv: Vec<String> = Vec::with_capacity(tokens.len() + 1);
+    let mut substituted = false;
+    for t in tokens {
+        if t == "{}" {
+            argv.push(p.clone());
+            substituted = true;
+        } else {
+            argv.push(t);
+        }
+    }
+    if !substituted {
+        argv.push(p);
+    }
+    RunRequest { argv, block, cwd }
 }
 
 /// Open a file (or selection) with an explicitly named program.
@@ -122,4 +171,57 @@ fn sniff_text(path: &Path) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cwd() -> PathBuf {
+        PathBuf::from("/tmp")
+    }
+
+    #[test]
+    fn build_command_appends_path_by_default() {
+        let r = build_command("rustranger", Path::new("/a/b.csv"), cwd());
+        assert_eq!(r.argv, vec!["rustranger", "/a/b.csv"]);
+        assert!(r.block, "terminal app runs in the foreground");
+    }
+
+    #[test]
+    fn build_command_substitutes_placeholder() {
+        let r = build_command("unzip -l {}", Path::new("/a/b.zip"), cwd());
+        assert_eq!(r.argv, vec!["unzip", "-l", "/a/b.zip"]);
+        assert!(r.block);
+    }
+
+    #[test]
+    fn build_command_trailing_amp_forks() {
+        let r = build_command("zathura &", Path::new("/a/b.pdf"), cwd());
+        assert_eq!(r.argv, vec!["zathura", "/a/b.pdf"]);
+        assert!(!r.block, "trailing & detaches (GUI app), TUI stays up");
+    }
+
+    #[test]
+    fn user_opener_wins_over_builtin() {
+        let openers = vec![("csv".to_string(), "rustranger".to_string())];
+        // .csv is in the built-in text list, but the user mapping takes priority.
+        let r = open_file(Path::new("/x/data.csv"), cwd(), &openers);
+        assert_eq!(r.argv[0], "rustranger");
+        assert_eq!(r.argv.last().unwrap(), "/x/data.csv");
+    }
+
+    #[test]
+    fn extension_match_is_case_insensitive() {
+        let openers = vec![("csv".to_string(), "rustranger".to_string())];
+        let r = open_file(Path::new("/x/DATA.CSV"), cwd(), &openers);
+        assert_eq!(r.argv[0], "rustranger");
+    }
+
+    #[test]
+    fn falls_back_to_generic_opener_for_unmapped_binary() {
+        let r = open_file(Path::new("/x/pic.png"), cwd(), &[]);
+        assert!(matches!(r.argv[0].as_str(), "xdg-open" | "open"));
+        assert!(!r.block);
+    }
 }
