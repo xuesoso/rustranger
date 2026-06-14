@@ -261,7 +261,9 @@ time_type = \"modified\"         # modified|created|changed|accessed
 time_format = \"date\"           # date (YYYY/MM/DD) | datetime (YYYY/MM/DD/HH/MM)
 size_format = \"human\"          # human (1.5k) | binary (1.5K, 1024-based) | bytes (1536)
 theme = \"default\"              # default|gruvbox-dark|gruvbox-light|solarized-dark|
-                               # solarized-light|nord|dracula|one-light|ayu-light
+                               # solarized-light|nord|dracula|subliminal|gitlab-dark|
+                               # gitlab-light|everforest-dark|everforest-light|
+                               # one-light|ayu-light
 
 # Override individual theme roles on top of the chosen theme. Values may be
 # #rrggbb, a basic color name, an ANSI index 0-255, or \"reset\".

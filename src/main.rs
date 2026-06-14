@@ -27,7 +27,9 @@ usage: rustranger [PATH] [options]
 
   --choosefile FILE         file-picker mode: write the chosen path and exit
   --theme NAME              default|gruvbox-dark|gruvbox-light|solarized-dark|
-                            solarized-light|nord|dracula|one-light|ayu-light
+                            solarized-light|nord|dracula|subliminal|gitlab-dark|
+                            gitlab-light|everforest-dark|everforest-light|
+                            one-light|ayu-light
   --sort KEY                natural|basename|size|mtime|ctime|atime|type|extension|random
   --reverse                 reverse the sort order
   --show-date               show the date column

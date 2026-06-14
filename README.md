@@ -120,7 +120,7 @@ are genuinely light):
 
 | Dark | Light |
 |------|-------|
-| `gruvbox-dark` · `solarized-dark` · `nord` · `dracula` | `gruvbox-light` · `solarized-light` · `one-light` · `ayu-light` |
+| `gruvbox-dark` · `solarized-dark` · `nord` · `dracula` · `subliminal` · `gitlab-dark` · `everforest-dark` | `gruvbox-light` · `solarized-light` · `one-light` · `ayu-light` · `gitlab-light` · `everforest-light` |
 
 `default` keeps the terminal's own background and uses the classic ANSI colors.
 Individual roles can be customized on top of the chosen theme with a `[theme]`

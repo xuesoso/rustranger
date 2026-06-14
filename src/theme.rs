@@ -67,6 +67,30 @@ impl Theme {
                 device: rgb(0xffb86c), broken: rgb(0xff5555), warning: rgb(0xf1fa8c),
                 error: rgb(0xff5555), info: rgb(0x6272a4), progress: rgb(0x50fa7b),
             },
+            // Subliminal — canonical iTerm2 palette (muted, teal-leaning).
+            "subliminal" => Theme {
+                bg: rgb(0x282c35), fg: rgb(0xd4d4d4), border: rgb(0x3a3f4b),
+                title: rgb(0xffe2a9), accent: rgb(0x6699cc), dir: rgb(0x6699cc),
+                link: rgb(0x5fb3b3), exec: rgb(0xa9cfa4), special: rgb(0xf1a5ab),
+                device: rgb(0xffe2a9), broken: rgb(0xe15a60), warning: rgb(0xffe2a9),
+                error: rgb(0xe15a60), info: rgb(0x7f7f7f), progress: rgb(0xa9cfa4),
+            },
+            // GitLab dark — from GitLab's Web IDE theme (purple keywords, blue
+            // functions, green strings, gold constants, salmon variables).
+            "gitlab-dark" | "gitlab" => Theme {
+                bg: rgb(0x28262b), fg: rgb(0xebebef), border: rgb(0x3d3b42),
+                title: rgb(0xe0a855), accent: rgb(0xbfa5fc), dir: rgb(0x7fb6ed),
+                link: rgb(0xbfa5fc), exec: rgb(0x6dc38f), special: rgb(0xf7998a),
+                device: rgb(0xe0a855), broken: rgb(0xf7998a), warning: rgb(0xe0a855),
+                error: rgb(0xf7998a), info: rgb(0x8c8a93), progress: rgb(0x6dc38f),
+            },
+            "everforest-dark" | "everforest" => Theme {
+                bg: rgb(0x2d353b), fg: rgb(0xd3c6aa), border: rgb(0x475258),
+                title: rgb(0xdbbc7f), accent: rgb(0xa7c080), dir: rgb(0x7fbbb3),
+                link: rgb(0x83c092), exec: rgb(0xa7c080), special: rgb(0xd699b6),
+                device: rgb(0xe69875), broken: rgb(0xe67e80), warning: rgb(0xdbbc7f),
+                error: rgb(0xe67e80), info: rgb(0x859289), progress: rgb(0xa7c080),
+            },
 
             // ---- light ----
             "gruvbox-light" => Theme {
@@ -96,6 +120,21 @@ impl Theme {
                 link: rgb(0x4cbf99), exec: rgb(0x86b300), special: rgb(0xa37acc),
                 device: rgb(0xf2ae49), broken: rgb(0xf07171), warning: rgb(0xf2ae49),
                 error: rgb(0xf07171), info: rgb(0x8a9199), progress: rgb(0x86b300),
+            },
+            // GitLab light — from GitLab's Web IDE theme.
+            "gitlab-light" => Theme {
+                bg: rgb(0xfafaff), fg: rgb(0x303030), border: rgb(0xdcdce0),
+                title: rgb(0xaf551d), accent: rgb(0x583cac), dir: rgb(0x006cd8),
+                link: rgb(0x583cac), exec: rgb(0x0a7f3d), special: rgb(0xa31700),
+                device: rgb(0xaf551d), broken: rgb(0xa31700), warning: rgb(0xaf551d),
+                error: rgb(0xa31700), info: rgb(0x767680), progress: rgb(0x0a7f3d),
+            },
+            "everforest-light" => Theme {
+                bg: rgb(0xfdf6e3), fg: rgb(0x5c6a72), border: rgb(0xe0dcc7),
+                title: rgb(0xdfa000), accent: rgb(0x8da101), dir: rgb(0x3a94c5),
+                link: rgb(0x35a77c), exec: rgb(0x8da101), special: rgb(0xdf69ba),
+                device: rgb(0xf57d26), broken: rgb(0xf85552), warning: rgb(0xdfa000),
+                error: rgb(0xf85552), info: rgb(0x939f91), progress: rgb(0x8da101),
             },
 
             _ => return None,
@@ -140,7 +179,8 @@ impl Theme {
     /// Comma-separated list of built-in theme names (for help/messages).
     pub fn names() -> &'static str {
         "default, gruvbox-dark, gruvbox-light, solarized-dark, solarized-light, \
-         nord, dracula, one-light, ayu-light"
+         nord, dracula, subliminal, gitlab-dark, gitlab-light, everforest-dark, \
+         everforest-light, one-light, ayu-light"
     }
 }
 
@@ -195,6 +235,8 @@ mod tests {
         for name in [
             "default", "gruvbox-dark", "gruvbox-light", "solarized-dark",
             "solarized-light", "nord", "dracula", "one-light", "ayu-light",
+            "subliminal", "gitlab-dark", "gitlab", "gitlab-light",
+            "everforest-dark", "everforest", "everforest-light",
         ] {
             assert!(Theme::by_name(name).is_some(), "{name} should resolve");
         }
