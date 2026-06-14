@@ -184,18 +184,27 @@ fn run(app: &mut App) -> io::Result<()> {
     let default = Style::new(crossterm::style::Color::Reset, crossterm::style::Color::Reset);
     let mut cur = Buffer::new(0, 0, default);
     let mut prev: Option<Buffer> = None;
+    // Forces a full repaint (clear + no diff baseline) on the next frame. Set on
+    // resize and after a blocking external program (editor/pager/shell), whose
+    // output left the real screen contents unknown to our diff model.
+    let mut needs_full = false;
     while !app.quit {
         app.prepare_view();
         if let Ok((cols, rows)) = crossterm::terminal::size() {
             let (cols, rows) = (cols as usize, rows as usize);
-            // On first paint / resize, drop the diff baseline and clear once (the
-            // only clear we ever emit — resize is rare, so its repaint is fine).
             if cur.cols != cols || cur.rows != rows {
                 cur = Buffer::new(cols, rows, default);
+                needs_full = true;
+            }
+            // On first paint / resize / resume-from-editor, drop the diff baseline
+            // and clear once so the whole screen is repainted (not just changed
+            // cells against a now-stale model).
+            if needs_full {
                 prev = None;
                 frame.clear();
                 screen::clear(&mut frame, default)?;
                 out.write_all(&frame)?;
+                needs_full = false;
             }
             let cursor = ui::render(&mut cur, app);
             frame.clear();
@@ -238,9 +247,12 @@ fn run(app: &mut App) -> io::Result<()> {
             app.tick_jobs();
         }
 
-        // Run any external program requested this iteration.
+        // Run any external program requested this iteration. A blocking program
+        // (editor/pager/shell) suspends the TUI, so force a full repaint after.
         if let Some(req) = app.pending_run.take() {
-            run_external(&mut out, req)?;
+            if run_external(&mut out, req)? {
+                needs_full = true;
+            }
         }
     }
     out.flush()?;
@@ -259,10 +271,14 @@ fn handle_event(app: &mut App, ev: Event, pending: &mut Option<char>, count: &mu
 
 /// Run an external program. Blocking programs (editors/pager/shell) suspend the
 /// TUI; forked GUI programs are detached and the TUI keeps running.
-fn run_external(out: &mut io::Stdout, req: open::RunRequest) -> io::Result<()> {
+///
+/// Returns `true` when the TUI was suspended (a blocking program ran), so the
+/// caller knows the terminal contents are now unknown and the next frame must be
+/// a full repaint rather than a diff against the pre-launch screen.
+fn run_external(out: &mut io::Stdout, req: open::RunRequest) -> io::Result<bool> {
     use std::process::{Command, Stdio};
     if req.argv.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let mut cmd = Command::new(&req.argv[0]);
     cmd.args(&req.argv[1..]).current_dir(&req.cwd);
@@ -276,13 +292,14 @@ fn run_external(out: &mut io::Stdout, req: open::RunRequest) -> io::Result<()> {
             // Swallow; nothing fatal, surface nothing for now.
             let _ = e;
         }
+        Ok(true)
     } else {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let _ = cmd.spawn();
+        Ok(false)
     }
-    Ok(())
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &mut Option<usize>) {
