@@ -111,33 +111,35 @@ impl Dir {
     /// Rebuild `files` (visible indices) from `files_all` applying current filters.
     pub fn refilter(&mut self, settings: &Settings) {
         let pointed = self.current().map(|e| e.name.clone());
+
+        // Lower-case the filter needle once (not once per entry), and match it
+        // against each name allocation-free (folding ASCII case on the fly).
+        let needle: Option<Vec<u8>> = self
+            .temporary_filter
+            .as_ref()
+            .filter(|f| !f.is_empty())
+            .map(|f| f.bytes().map(|b| b.to_ascii_lowercase()).collect());
+        let hide_dotfiles = !settings.show_hidden && settings.hidden_filter_dotfiles;
+
         self.files = self
             .files_all
             .iter()
             .enumerate()
-            .filter(|(_, e)| self.is_visible(e, settings))
+            .filter(|(_, e)| {
+                if hide_dotfiles && e.name.starts_with('.') {
+                    return false;
+                }
+                match &needle {
+                    Some(n) => ci_contains(&e.name, n),
+                    None => true,
+                }
+            })
             .map(|(i, _)| i)
             .collect();
         self.clamp_pointer();
         if let Some(name) = pointed {
             self.select_name(&name);
         }
-    }
-
-    fn is_visible(&self, e: &Entry, settings: &Settings) -> bool {
-        if !settings.show_hidden && settings.hidden_filter_dotfiles && e.name.starts_with('.') {
-            return false;
-        }
-        if let Some(filter) = &self.temporary_filter {
-            if !e
-                .name
-                .to_lowercase()
-                .contains(&filter.to_lowercase())
-            {
-                return false;
-            }
-        }
-        true
     }
 
     pub fn len(&self) -> usize {
@@ -291,6 +293,28 @@ fn dir_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// Case-insensitive substring test (ASCII case folding), allocation-free.
+/// `needle` must already be ASCII-lowercased. Non-ASCII bytes compare exactly,
+/// matching the sort comparator's ASCII-only folding.
+fn ci_contains(haystack: &str, needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let h = haystack.as_bytes();
+    if needle.len() > h.len() {
+        return false;
+    }
+    'outer: for start in 0..=h.len() - needle.len() {
+        for (j, &nb) in needle.iter().enumerate() {
+            if h[start + j].to_ascii_lowercase() != nb {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +408,55 @@ mod tests {
         assert_eq!(d.current().map(|e| e.name.as_str()), Some("a"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Locks filter/hidden visibility: dotfiles hidden unless show_hidden; the
+    /// temporary filter is a case-insensitive substring match over the name.
+    #[test]
+    fn temporary_filter_and_hidden_visibility() {
+        let dir = std::env::temp_dir().join(format!("rr_dir_filt_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for n in ["Alpha.txt", "alpha.log", "beta.txt", ".hidden", "GAMMA"] {
+            fs::write(dir.join(n), b"x").unwrap();
+        }
+        let mut settings = Settings::default();
+        let mut d = Dir::new(dir.clone());
+        d.load(&settings);
+        // .hidden excluded by default.
+        assert_eq!(d.len(), 4);
+
+        // Case-insensitive substring "alpha" matches Alpha.txt and alpha.log.
+        d.temporary_filter = Some("alpha".to_string());
+        d.refilter(&settings);
+        let mut got: Vec<&str> = d.visible().map(|e| e.name.as_str()).collect();
+        got.sort_unstable();
+        assert_eq!(got, ["Alpha.txt", "alpha.log"]);
+
+        // Mixed-case query still matches (case-insensitive).
+        d.temporary_filter = Some("ALP".to_string());
+        d.refilter(&settings);
+        assert_eq!(d.len(), 2);
+
+        // Clearing the filter + showing hidden reveals all five.
+        d.temporary_filter = None;
+        settings.show_hidden = true;
+        d.refilter(&settings);
+        assert_eq!(d.len(), 5);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ci_contains_matches_case_insensitively() {
+        assert!(ci_contains("Alpha.txt", b"alpha"));
+        assert!(ci_contains("README", b"adme"));
+        assert!(ci_contains("anything", b"")); // empty needle matches
+        assert!(!ci_contains("beta", b"alpha"));
+        assert!(!ci_contains("ab", b"abc")); // needle longer than haystack
+        // Needle is pre-lowercased by contract; haystack folds ASCII on the fly,
+        // so uppercase haystack letters still match a lowercase needle.
+        assert!(ci_contains("MixedCASE", b"edcas"));
+        assert!(ci_contains("café", b"caf")); // non-ASCII 'é' untouched, "caf" matches
     }
 }

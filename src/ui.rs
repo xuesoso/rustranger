@@ -1,22 +1,17 @@
 // Miller-columns renderer (parent | current | preview) with borders and bars.
 // Ported in spirit from ranger/gui/widgets/view_miller.py + browsercolumn.py.
 //
-// Colors come from the active `Theme`. The whole screen is painted with the
-// theme background each frame (so light themes are genuinely light), and every
-// drawn element sets both foreground and background before printing so a trailing
-// reset can never leak the terminal-default background into the next cells.
+// Drawing targets an in-memory cell `Buffer` (see crate::screen); the run loop
+// diffs successive buffers and emits only changed cells. Colors come from the
+// active `Theme`; the buffer is reset to the theme background each frame so the
+// whole screen is "painted" without ever clearing it.
 
-use std::io::{self, Write};
-
-use crossterm::style::{
-    Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-};
-use crossterm::terminal::{Clear, ClearType};
-use crossterm::{cursor::MoveTo, queue};
+use crossterm::style::Color;
 
 use crate::app::App;
 use crate::config::{Settings, SizeFormat, TimeFormat, TimeType};
 use crate::fs::{Dir, Entry, FType};
+use crate::screen::{Buffer, Style};
 use crate::theme::Theme;
 use crate::util;
 
@@ -24,50 +19,40 @@ use crate::util;
 /// info column is allowed to take space (the info is dropped in narrower columns).
 const MIN_NAME_WIDTH: usize = 24;
 
-pub fn draw(out: &mut impl Write, app: &App) -> io::Result<()> {
-    let (cols, rows) = crossterm::terminal::size()?;
-    let (cols, rows) = (cols as usize, rows as usize);
-    if rows < 3 || cols < 4 {
-        return Ok(());
-    }
+/// Render one frame into `buf` (sized to the terminal). Returns the hardware
+/// cursor position to show (only in console mode), or None to keep it hidden.
+pub fn render(buf: &mut Buffer, app: &App) -> Option<(u16, u16)> {
     let t = &app.settings.theme;
+    buf.reset(Style::new(t.fg, t.bg));
 
-    // Paint the entire screen with the theme background.
-    queue!(
-        out,
-        SetForegroundColor(t.fg),
-        SetBackgroundColor(t.bg),
-        Clear(ClearType::All),
-    )?;
-    if app.console.is_none() {
-        queue!(out, crossterm::cursor::Hide)?;
+    let (cols, rows) = (buf.cols, buf.rows);
+    if rows < 3 || cols < 4 {
+        return None;
     }
-    draw_titlebar(out, app, cols, t)?;
 
-    let body_top = 1u16;
+    draw_titlebar(buf, app, cols, t);
+
+    let body_top = 1usize;
     let body_height = rows - 2;
+    let mut cursor = None;
 
-    // The help overlay replaces the browser view entirely while open.
     if let Some(scroll) = app.help {
-        draw_help(out, scroll, body_top, body_height, cols, t)?;
-        out.flush()?;
-        return Ok(());
-    }
-
-    draw_miller(out, app, body_top, body_height, cols, t)?;
-    if app.console.is_some() {
-        draw_console(out, app, rows as u16 - 1, cols, t)?;
+        // The help overlay replaces the browser view entirely while open.
+        draw_help(buf, scroll, body_top, body_height, cols, t);
     } else {
-        draw_statusbar(out, app, rows as u16 - 1, cols, t)?;
+        draw_miller(buf, app, body_top, body_height, cols, t);
+        if app.console.is_some() {
+            cursor = draw_console(buf, app, rows - 1, cols, t);
+        } else {
+            draw_statusbar(buf, app, rows - 1, cols, t);
+        }
+        // A pending key-chain hint (e.g. the sort menu) overlays everything else.
+        if let Some(menu) = &app.menu {
+            draw_menu(buf, menu, cols, rows, t);
+        }
     }
 
-    // A pending key-chain hint (e.g. the sort menu) overlays everything else.
-    if let Some(menu) = &app.menu {
-        draw_menu(out, menu, cols, rows, t)?;
-    }
-
-    out.flush()?;
-    Ok(())
+    cursor
 }
 
 /// Pad `s` with trailing spaces to a target display width (no-op if already wider).
@@ -80,16 +65,59 @@ fn pad_right(s: &str, width: usize) -> String {
     }
 }
 
+// ---- title bar -------------------------------------------------------------
+
+fn draw_titlebar(buf: &mut Buffer, app: &App, cols: usize, t: &Theme) {
+    let base = Style::new(t.fg, t.bg);
+
+    // Right side: tab indicators (only shown when more than one tab is open).
+    let tabs = if app.tab_count() > 1 {
+        let mut s = String::new();
+        for i in 0..app.tab_count() {
+            if i == app.current_tab {
+                s.push_str(&format!("[{}]", i + 1));
+            } else {
+                s.push_str(&format!(" {} ", i + 1));
+            }
+        }
+        s
+    } else {
+        String::new()
+    };
+    let tabs_w = util::display_width(&tabs);
+    let path_budget = cols.saturating_sub(tabs_w + 1);
+
+    let cwd = app.cwd();
+    let path = cwd.to_string_lossy();
+    let (head, tail) = split_breadcrumb(&path);
+    let head = util::truncate(&head, path_budget);
+    let mut x = buf.set_str(0, 0, &head, Style::new(t.title, t.bg).bold());
+    if util::display_width(&head) + util::display_width(&tail) <= path_budget {
+        x = buf.set_str(x, 0, &tail, base);
+    }
+    let _ = x;
+
+    if !tabs.is_empty() {
+        buf.set_str(cols - tabs_w, 0, &tabs, Style::new(t.accent, t.bg));
+    }
+}
+
+/// Split a path into ("/parent/dirs/", "basename") for breadcrumb styling.
+fn split_breadcrumb(path: &str) -> (String, String) {
+    if path == "/" {
+        return (String::new(), "/".to_string());
+    }
+    match path.rsplit_once('/') {
+        Some((head, tail)) => (format!("{}/", head), tail.to_string()),
+        None => (String::new(), path.to_string()),
+    }
+}
+
+// ---- key-chain menu --------------------------------------------------------
+
 /// Draw a key-chain hint menu as a bordered popup anchored to the bottom-right,
 /// just above the status bar. Long lists are clamped to the available height.
-fn draw_menu(
-    out: &mut impl Write,
-    menu: &crate::app::KeyMenu,
-    cols: usize,
-    rows: usize,
-    t: &Theme,
-) -> io::Result<()> {
-    // Clamp the row count to what fits (title bar + top/title/bottom + status bar).
+fn draw_menu(buf: &mut Buffer, menu: &crate::app::KeyMenu, cols: usize, rows: usize, t: &Theme) {
     let max_items = rows.saturating_sub(5).max(1);
     let mut items: Vec<(String, String)> = menu.items.clone();
     if items.len() > max_items {
@@ -97,7 +125,6 @@ fn draw_menu(
         items.push((String::new(), "…".to_string()));
     }
 
-    // Widest content row decides the interior width (key column + 2 + description).
     let key_w = items.iter().map(|(k, _)| util::display_width(k)).max().unwrap_or(1);
     let interior = items
         .iter()
@@ -105,66 +132,42 @@ fn draw_menu(
         .chain(std::iter::once(util::display_width(&menu.title)))
         .max()
         .unwrap_or(0)
-        .min(cols.saturating_sub(5)); // keep the box on-screen
+        .min(cols.saturating_sub(5));
 
-    let box_w = interior + 4; // 2 border cells + 1 space padding each side
-    let box_h = items.len() + 3; // top border + title + items + bottom border
-
-    // Anchor bottom-right, leaving the status line (rows-1) clear; clamp on small terminals.
+    let box_w = interior + 4;
+    let box_h = items.len() + 3;
     let x = cols.saturating_sub(box_w + 1);
     let top = rows.saturating_sub(box_h + 1).max(1);
     let avail = cols.saturating_sub(x);
 
+    let border = Style::new(t.border, t.bg);
     let hline = "─".repeat(interior + 2);
 
-    // Top border.
-    queue!(
-        out,
-        MoveTo(x as u16, top as u16),
-        SetBackgroundColor(t.bg),
-        SetForegroundColor(t.border),
-        Print(util::truncate(&format!("┌{}┐", hline), avail)),
-    )?;
-    // Title row (bold, in the title color, between border edges).
-    queue!(
-        out,
-        MoveTo(x as u16, (top + 1) as u16),
-        SetBackgroundColor(t.bg),
-        SetForegroundColor(t.border),
-        Print("│ "),
-        SetForegroundColor(t.title),
-        SetAttribute(Attribute::Bold),
-        Print(util::truncate(&pad_right(&menu.title, interior), interior)),
-        SetAttribute(Attribute::NormalIntensity),
-        SetForegroundColor(t.border),
-        Print(" │"),
-    )?;
-    // One row per item: right-aligned key, two spaces, description.
+    buf.set_str(x, top, &util::truncate(&format!("┌{}┐", hline), avail), border);
+
+    let mut cx = buf.set_str(x, top + 1, "│ ", border);
+    cx = buf.set_str(
+        cx,
+        top + 1,
+        &util::truncate(&pad_right(&menu.title, interior), interior),
+        Style::new(t.title, t.bg).bold(),
+    );
+    buf.set_str(cx, top + 1, " │", border);
+
     for (i, (key, desc)) in items.iter().enumerate() {
         let pad = " ".repeat(key_w.saturating_sub(util::display_width(key)));
         let row = format!("{}{}  {}", pad, key, desc);
-        queue!(
-            out,
-            MoveTo(x as u16, (top + 2 + i) as u16),
-            SetBackgroundColor(t.bg),
-            SetForegroundColor(t.border),
-            Print("│ "),
-            SetForegroundColor(t.accent),
-            Print(util::truncate(&pad_right(&row, interior), interior)),
-            SetForegroundColor(t.border),
-            Print(" │"),
-        )?;
+        let mut cx = buf.set_str(x, top + 2 + i, "│ ", border);
+        cx = buf.set_str(
+            cx,
+            top + 2 + i,
+            &util::truncate(&pad_right(&row, interior), interior),
+            Style::new(t.accent, t.bg),
+        );
+        buf.set_str(cx, top + 2 + i, " │", border);
     }
-    // Bottom border.
-    queue!(
-        out,
-        MoveTo(x as u16, (top + box_h - 1) as u16),
-        SetBackgroundColor(t.bg),
-        SetForegroundColor(t.border),
-        Print(util::truncate(&format!("└{}┘", hline), avail)),
-        ResetColor,
-    )?;
-    Ok(())
+
+    buf.set_str(x, top + box_h - 1, &util::truncate(&format!("└{}┘", hline), avail), border);
 }
 
 // ---- help overlay ----------------------------------------------------------
@@ -239,169 +242,59 @@ pub fn help_len() -> usize {
 }
 
 /// Draw the scrollable help overlay as a full-width bordered panel.
-fn draw_help(
-    out: &mut impl Write,
-    scroll: usize,
-    top: u16,
-    height: usize,
-    cols: usize,
-    t: &Theme,
-) -> io::Result<()> {
-    let top = top as usize;
-    let inner_w = cols.saturating_sub(4); // text area between "│ " and " │"
-    let inner_h = height.saturating_sub(2); // minus top + bottom border rows
+fn draw_help(buf: &mut Buffer, scroll: usize, top: usize, height: usize, cols: usize, t: &Theme) {
+    let border = Style::new(t.border, t.bg);
+    let inner_w = cols.saturating_sub(4);
+    let inner_h = height.saturating_sub(2);
     let max_scroll = HELP.len().saturating_sub(inner_h);
     let scroll = scroll.min(max_scroll);
 
-    // Top border carries the title and the scroll hint.
     let mut tb = String::from("┌─ Help (j/k scroll · g/G top/bottom · q close) ");
     let used = util::display_width(&tb);
     if used + 1 < cols {
         tb.push_str(&"─".repeat(cols - 1 - used));
     }
     tb.push('┐');
-    queue!(
-        out,
-        MoveTo(0, top as u16),
-        SetBackgroundColor(t.bg),
-        SetForegroundColor(t.border),
-        Print(util::truncate(&tb, cols)),
-    )?;
+    buf.set_str(0, top, &util::truncate(&tb, cols), border);
 
     for row in 0..inner_h {
-        let y = (top + 1 + row) as u16;
-        queue!(
-            out,
-            MoveTo(0, y),
-            SetBackgroundColor(t.bg),
-            SetForegroundColor(t.border),
-            Print("│ "),
-        )?;
+        let y = top + 1 + row;
+        let mut cx = buf.set_str(0, y, "│ ", border);
         if let Some(line) = HELP.get(scroll + row) {
             let header = !line.is_empty() && !line.starts_with(' ');
-            if header {
-                queue!(out, SetForegroundColor(t.title), SetAttribute(Attribute::Bold))?;
+            let style = if header {
+                Style::new(t.title, t.bg).bold()
             } else {
-                queue!(out, SetForegroundColor(t.fg))?;
-            }
-            queue!(
-                out,
-                Print(pad_right(&util::truncate(line, inner_w), inner_w)),
-                SetAttribute(Attribute::NormalIntensity),
-            )?;
+                Style::new(t.fg, t.bg)
+            };
+            cx = buf.set_str(cx, y, &pad_right(&util::truncate(line, inner_w), inner_w), style);
         } else {
-            queue!(out, Print(" ".repeat(inner_w)))?;
+            cx = buf.set_str(cx, y, &" ".repeat(inner_w), Style::new(t.fg, t.bg));
         }
-        queue!(out, SetForegroundColor(t.border), Print(" │"))?;
+        buf.set_str(cx, y, " │", border);
     }
 
-    // Bottom border.
-    queue!(
-        out,
-        MoveTo(0, (top + height - 1) as u16),
-        SetBackgroundColor(t.bg),
-        SetForegroundColor(t.border),
-        Print(util::truncate(&format!("└{}┘", "─".repeat(cols.saturating_sub(2))), cols)),
-        ResetColor,
-    )?;
-    Ok(())
+    buf.set_str(
+        0,
+        top + height - 1,
+        &util::truncate(&format!("└{}┘", "─".repeat(cols.saturating_sub(2))), cols),
+        border,
+    );
 }
 
-fn draw_console(out: &mut impl Write, app: &App, y: u16, cols: usize, t: &Theme) -> io::Result<()> {
-    let Some(console) = &app.console else {
-        return Ok(());
-    };
+// ---- console ---------------------------------------------------------------
+
+fn draw_console(buf: &mut Buffer, app: &App, y: usize, cols: usize, t: &Theme) -> Option<(u16, u16)> {
+    let console = app.console.as_ref()?;
     let line = format!("{}{}", console.prompt, console.input);
-    queue!(
-        out,
-        MoveTo(0, y),
-        SetForegroundColor(t.fg),
-        SetBackgroundColor(t.bg),
-        Clear(ClearType::CurrentLine),
-        Print(util::truncate(&line, cols)),
-    )?;
-    // Place the hardware cursor at the edit position and show it.
-    let cursor_x = (1 + console.cursor).min(cols.saturating_sub(1)) as u16;
-    queue!(out, MoveTo(cursor_x, y), crossterm::cursor::Show)?;
-    Ok(())
-}
-
-// ---- title bar -------------------------------------------------------------
-
-fn draw_titlebar(out: &mut impl Write, app: &App, cols: usize, t: &Theme) -> io::Result<()> {
-    // Right side: tab indicators (only shown when more than one tab is open).
-    let tabs = if app.tab_count() > 1 {
-        let mut s = String::new();
-        for i in 0..app.tab_count() {
-            if i == app.current_tab {
-                s.push_str(&format!("[{}]", i + 1));
-            } else {
-                s.push_str(&format!(" {} ", i + 1));
-            }
-        }
-        s
-    } else {
-        String::new()
-    };
-    let tabs_w = util::display_width(&tabs);
-    let path_budget = cols.saturating_sub(tabs_w + 1);
-
-    let cwd = app.cwd();
-    let path = cwd.to_string_lossy();
-    let (head, tail) = split_breadcrumb(&path);
-    let head = util::truncate(&head, path_budget);
-    queue!(
-        out,
-        MoveTo(0, 0),
-        SetBackgroundColor(t.bg),
-        SetForegroundColor(t.title),
-        SetAttribute(Attribute::Bold),
-        Print(&head),
-    )?;
-    if util::display_width(&head) + util::display_width(&tail) <= path_budget {
-        queue!(
-            out,
-            SetAttribute(Attribute::NormalIntensity),
-            SetForegroundColor(t.fg),
-            Print(&tail),
-        )?;
-    }
-    queue!(out, SetAttribute(Attribute::Reset))?;
-
-    if !tabs.is_empty() {
-        queue!(
-            out,
-            MoveTo((cols - tabs_w) as u16, 0),
-            SetBackgroundColor(t.bg),
-            SetForegroundColor(t.accent),
-            Print(&tabs),
-        )?;
-    }
-    queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
-    Ok(())
-}
-
-/// Split a path into ("/parent/dirs/", "basename") for breadcrumb styling.
-fn split_breadcrumb(path: &str) -> (String, String) {
-    if path == "/" {
-        return (String::new(), "/".to_string());
-    }
-    match path.rsplit_once('/') {
-        Some((head, tail)) => (format!("{}/", head), tail.to_string()),
-        None => (String::new(), path.to_string()),
-    }
+    buf.set_str(0, y, &util::truncate(&line, cols), Style::new(t.fg, t.bg));
+    let cursor_x = (1 + console.cursor).min(cols.saturating_sub(1));
+    Some((cursor_x as u16, y as u16))
 }
 
 // ---- miller layout ---------------------------------------------------------
 
-fn draw_miller(
-    out: &mut impl Write,
-    app: &App,
-    top: u16,
-    height: usize,
-    cols: usize,
-    t: &Theme,
-) -> io::Result<()> {
+fn draw_miller(buf: &mut Buffer, app: &App, top: usize, height: usize, cols: usize, t: &Theme) {
     let ratios = &app.settings.column_ratios;
     let layout = column_layout(cols, ratios);
     let n = layout.len();
@@ -411,11 +304,10 @@ fn draw_miller(
         let is_main = i + 1 == n - 1 || (n == 1);
 
         if is_preview {
-            draw_preview_column(out, app, x, top, width, height, t)?;
+            draw_preview_column(buf, app, x, top, width, height, t);
         } else if is_main {
-            // The date column is shown only in the current (main) column.
             draw_filelist(
-                out,
+                buf,
                 app.current_dir(),
                 &app.tags,
                 &app.settings,
@@ -426,24 +318,17 @@ fn draw_miller(
                 height,
                 true,
                 t,
-            )?;
-        } else {
-            // Parent column(s): for a 3-column layout, just the immediate parent.
-            if let Some(p) = app.parent_path().and_then(|p| app.get_cached(&p).map(|_| p)) {
-                let dir = app.get_cached(&p).unwrap();
-                draw_filelist(out, dir, &app.tags, &app.settings, false, x, top, width, height, true, t)?;
-            }
+            );
+        } else if let Some(p) = app.parent_path().and_then(|p| app.get_cached(&p).map(|_| p)) {
+            let dir = app.get_cached(&p).unwrap();
+            draw_filelist(buf, dir, &app.tags, &app.settings, false, x, top, width, height, true, t);
         }
 
-        // Draw the separator/border to the right of this column.
-        if i + 1 < n {
-            let bx = (x + width) as u16;
-            if app.settings.draw_borders {
-                draw_vline(out, bx, top, height, t)?;
-            }
+        // Separator/border to the right of this column.
+        if i + 1 < n && app.settings.draw_borders {
+            draw_vline(buf, x + width, top, height, t);
         }
     }
-    Ok(())
 }
 
 /// Distribute `cols` across the ratio list, leaving 1 gap column between panes.
@@ -457,7 +342,6 @@ fn column_layout(cols: usize, ratios: &[u32]) -> Vec<(usize, usize)> {
         .iter()
         .map(|&r| (usable * r as usize) / total as usize)
         .collect();
-    // Hand any rounding remainder to the (main) column second-from-right.
     let assigned: usize = widths.iter().sum();
     if usable > assigned {
         let idx = n.saturating_sub(2);
@@ -468,137 +352,72 @@ fn column_layout(cols: usize, ratios: &[u32]) -> Vec<(usize, usize)> {
     let mut x = 0usize;
     for w in widths {
         out.push((x, w));
-        x += w + 1; // +1 for the gap/border column
+        x += w + 1;
     }
     out
 }
 
-fn draw_preview_column(
-    out: &mut impl Write,
-    app: &App,
-    x: usize,
-    top: u16,
-    width: usize,
-    height: usize,
-    t: &Theme,
-) -> io::Result<()> {
-    let selected = app.current_dir().current();
-    let Some(entry) = selected else {
-        return Ok(());
+fn draw_preview_column(buf: &mut Buffer, app: &App, x: usize, top: usize, width: usize, height: usize, t: &Theme) {
+    let Some(entry) = app.current_dir().current() else {
+        return;
     };
-
     if entry.is_dir() && entry.accessible {
         if let Some(dir) = app.get_cached(&entry.path) {
-            draw_filelist(out, dir, &app.tags, &app.settings, false, x, top, width, height, false, t)?;
+            draw_filelist(buf, dir, &app.tags, &app.settings, false, x, top, width, height, false, t);
         }
     } else if matches!(entry.ftype, FType::File) {
-        draw_file_preview(out, app, x, top, width, height, t)?;
+        draw_file_preview(buf, app, x, top, width, height, t);
     } else {
         let info = format!("{:?}", entry.ftype);
-        queue!(
-            out,
-            MoveTo(x as u16, top),
-            SetBackgroundColor(t.bg),
-            SetForegroundColor(t.info),
-            Print(util::truncate(&info, width)),
-            ResetColor,
-        )?;
+        buf.set_str(x, top, &util::truncate(&info, width), Style::new(t.info, t.bg));
     }
-    Ok(())
 }
 
-fn draw_file_preview(
-    out: &mut impl Write,
-    app: &App,
-    x: usize,
-    top: u16,
-    width: usize,
-    height: usize,
-    t: &Theme,
-) -> io::Result<()> {
+fn draw_file_preview(buf: &mut Buffer, app: &App, x: usize, top: usize, width: usize, height: usize, t: &Theme) {
     use crate::preview::Preview;
     match app.current_preview() {
         Some(Preview::Text(lines)) => {
             let start = app.preview_scroll.min(lines.len().saturating_sub(1));
+            let style = Style::new(t.fg, t.bg);
             for (row, line) in lines.iter().skip(start).take(height).enumerate() {
-                queue!(
-                    out,
-                    MoveTo(x as u16, top + row as u16),
-                    SetBackgroundColor(t.bg),
-                    SetForegroundColor(t.fg),
-                    Print(util::truncate(line, width)),
-                )?;
+                buf.set_str(x, top + row, &util::truncate(line, width), style);
             }
         }
-        Some(Preview::Binary) => placeholder(out, x, top, width, "(binary file)", t.info, t)?,
-        Some(Preview::TooBig) => {
-            placeholder(out, x, top, width, "(file too large to preview)", t.info, t)?
-        }
-        Some(Preview::Empty) => placeholder(out, x, top, width, "(empty)", t.warning, t)?,
-        Some(Preview::Error(e)) => {
-            placeholder(out, x, top, width, &format!("(error: {})", e), t.error, t)?
-        }
+        Some(Preview::Binary) => placeholder(buf, x, top, width, "(binary file)", t.info, t),
+        Some(Preview::TooBig) => placeholder(buf, x, top, width, "(file too large to preview)", t.info, t),
+        Some(Preview::Empty) => placeholder(buf, x, top, width, "(empty)", t.warning, t),
+        Some(Preview::Error(e)) => placeholder(buf, x, top, width, &format!("(error: {})", e), t.error, t),
         None => {}
     }
-    Ok(())
 }
 
-fn placeholder(
-    out: &mut impl Write,
-    x: usize,
-    top: u16,
-    width: usize,
-    msg: &str,
-    color: Color,
-    t: &Theme,
-) -> io::Result<()> {
-    queue!(
-        out,
-        MoveTo(x as u16, top),
-        SetBackgroundColor(t.bg),
-        SetForegroundColor(color),
-        Print(util::truncate(msg, width)),
-        ResetColor,
-    )
+fn placeholder(buf: &mut Buffer, x: usize, top: usize, width: usize, msg: &str, color: Color, t: &Theme) {
+    buf.set_str(x, top, &util::truncate(msg, width), Style::new(color, t.bg));
 }
 
 // ---- file list column ------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 fn draw_filelist(
-    out: &mut impl Write,
+    buf: &mut Buffer,
     dir: &Dir,
     tags: &crate::state::tags::Tags,
     settings: &Settings,
     with_time: bool,
     x: usize,
-    top: u16,
+    top: usize,
     width: usize,
     height: usize,
     focused: bool,
     t: &Theme,
-) -> io::Result<()> {
+) {
     if let Some(err) = &dir.error {
-        queue!(
-            out,
-            MoveTo(x as u16, top),
-            SetBackgroundColor(t.bg),
-            SetForegroundColor(t.error),
-            Print(util::truncate(&format!("error: {}", err), width)),
-            ResetColor,
-        )?;
-        return Ok(());
+        buf.set_str(x, top, &util::truncate(&format!("error: {}", err), width), Style::new(t.error, t.bg));
+        return;
     }
     if dir.is_empty() {
-        queue!(
-            out,
-            MoveTo(x as u16, top),
-            SetBackgroundColor(t.bg),
-            SetForegroundColor(t.warning),
-            Print(util::truncate("(empty)", width)),
-            ResetColor,
-        )?;
-        return Ok(());
+        buf.set_str(x, top, &util::truncate("(empty)", width), Style::new(t.warning, t.bg));
+        return;
     }
 
     let offset = scroll_begin(dir.pointer, dir.len(), height);
@@ -610,33 +429,28 @@ fn draw_filelist(
         let entry = dir.entry_at(idx).unwrap();
         let selected = focused && idx == dir.pointer;
         let tag = tags.marker(&entry.path);
-        draw_entry_row(out, entry, tag, selected, settings, with_time, x, top + row as u16, width, t)?;
+        draw_entry_row(buf, entry, tag, selected, settings, with_time, x, top + row, width, t);
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn draw_entry_row(
-    out: &mut impl Write,
+    buf: &mut Buffer,
     entry: &Entry,
     tag: Option<char>,
     selected: bool,
     settings: &Settings,
     with_time: bool,
     x: usize,
-    y: u16,
+    y: usize,
     width: usize,
     t: &Theme,
-) -> io::Result<()> {
+) {
     let (color, type_bold) = entry_style(entry, t);
-    // Marked (spacebar) and tagged (t) entries are shown as a full inverted row.
+    // Marked (spacebar) and tagged (t) entries, and the cursor row, invert.
     let marked = entry.marked || tag.is_some();
-    // The cursor row is also inverted; both it and marks reverse the colors.
     let highlighted = selected || marked;
 
-    // The file name gets priority: reserve it at least MIN_NAME_WIDTH columns and
-    // only show the date/size info block when it still fits beyond that minimum.
-    // In narrow columns the info is dropped so names stay readable.
     let info = info_string(entry, settings, with_time);
     let info = if width >= MIN_NAME_WIDTH + util::display_width(&info) + 2 {
         info
@@ -649,33 +463,29 @@ fn draw_entry_row(
     let name_budget = width.saturating_sub(gutter_and_gap);
     let name = util::truncate(&entry.name, name_budget);
 
-    // Base colors first; Reverse then swaps them so the row becomes a colored bar.
-    queue!(out, MoveTo(x as u16, y), SetBackgroundColor(t.bg), SetForegroundColor(color))?;
-    if highlighted {
-        queue!(out, SetAttribute(Attribute::Reverse))?;
+    // Build the full-width row so the whole column cell range carries the row's
+    // style (so a highlighted row is a solid bar to the right edge).
+    let left = format!(" {}", name);
+    let used = util::display_width(&left);
+    let mut row = left;
+    if used + info_w < width {
+        row.push_str(&" ".repeat(width - used - info_w));
+        row.push_str(&info);
+    } else if used < width {
+        row.push_str(&" ".repeat(width - used));
     }
-    // On an inverted row, bold marks the cursor (so it stands out among marked
-    // rows); on a normal row, bold conveys the file type as before.
+
+    let mut style = Style::new(color, t.bg);
+    if highlighted {
+        style = style.reversed();
+    }
+    // On an inverted row, bold marks the cursor among marked rows; otherwise bold
+    // conveys the file type.
     let bold = if highlighted { selected } else { type_bold };
     if bold {
-        queue!(out, SetAttribute(Attribute::Bold))?;
+        style = style.bold();
     }
-
-    // A single leading space as a gutter (the former *-marker column).
-    let left = format!(" {}", name);
-    queue!(out, Print(&left))?;
-
-    let used = util::display_width(&left);
-    if used + info_w < width {
-        let pad = width - used - info_w;
-        queue!(out, Print(" ".repeat(pad)), Print(&info))?;
-    } else if used < width {
-        queue!(out, Print(" ".repeat(width - used)))?;
-    }
-
-    // Clear attributes and restore the theme base so nothing bleeds into later cells.
-    queue!(out, SetAttribute(Attribute::Reset), SetForegroundColor(t.fg), SetBackgroundColor(t.bg))?;
-    Ok(())
+    buf.set_str(x, y, &row, style);
 }
 
 fn entry_style(entry: &Entry, t: &Theme) -> (Color, bool) {
@@ -703,7 +513,6 @@ fn format_size(bytes: u64, settings: &Settings) -> String {
 
 /// The right-aligned info block for a row: the date column (when `with_time`)
 /// followed by the size, both in fixed-width fields so they align as columns.
-/// Directories show no size.
 fn info_string(entry: &Entry, settings: &Settings, with_time: bool) -> String {
     let size = match entry.ftype {
         FType::Dir => String::new(),
@@ -719,21 +528,19 @@ fn info_string(entry: &Entry, settings: &Settings, with_time: bool) -> String {
         TimeType::Accessed => entry.atime,
     };
     let date = util::format_time(secs, matches!(settings.time_format, TimeFormat::DateTime));
-    // Date column, then a fixed-width size column kept flush to the right edge.
-    // Raw byte counts need a wider field than the compact human-readable forms.
     let size_w = if matches!(settings.size_format, SizeFormat::Bytes) { 11 } else { 6 };
     format!("{}  {:>size_w$}", date, size)
 }
 
 // ---- status bar ------------------------------------------------------------
 
-fn draw_statusbar(out: &mut impl Write, app: &App, y: u16, cols: usize, t: &Theme) -> io::Result<()> {
+fn draw_statusbar(buf: &mut Buffer, app: &App, y: usize, cols: usize, t: &Theme) {
     let dir = app.current_dir();
 
     // While a background copy/move runs, show an aggregate progress bar instead.
     if app.jobs_active() {
-        let (done, total) = app.jobs.iter().fold((0u64, 0u64), |(d, t), j| {
-            (d + j.progress().done, t + j.progress().total)
+        let (done, total) = app.jobs.iter().fold((0u64, 0u64), |(d, tot), j| {
+            (d + j.progress().done, tot + j.progress().total)
         });
         let pct = done.saturating_mul(100).checked_div(total).unwrap_or(0).min(100);
         let bar_w = 20usize.min(cols.saturating_sub(30));
@@ -754,15 +561,8 @@ fn draw_statusbar(out: &mut impl Write, app: &App, y: u16, cols: usize, t: &Them
             util::human_size(total),
             label,
         );
-        queue!(
-            out,
-            MoveTo(0, y),
-            SetBackgroundColor(t.bg),
-            SetForegroundColor(t.progress),
-            Print(util::truncate(&text, cols)),
-            ResetColor,
-        )?;
-        return Ok(());
+        buf.set_str(0, y, &util::truncate(&text, cols), Style::new(t.progress, t.bg));
+        return;
     }
 
     let left = if let Some(msg) = &app.message {
@@ -795,18 +595,10 @@ fn draw_statusbar(out: &mut impl Write, app: &App, y: u16, cols: usize, t: &Them
     let used = util::display_width(&left);
     let pad = cols.saturating_sub(used + right.len());
 
-    queue!(
-        out,
-        MoveTo(0, y),
-        SetBackgroundColor(t.bg),
-        SetForegroundColor(t.info),
-        Print(left),
-        Print(" ".repeat(pad)),
-        SetForegroundColor(t.accent),
-        Print(right),
-        ResetColor,
-    )?;
-    Ok(())
+    let info = Style::new(t.info, t.bg);
+    let mut cx = buf.set_str(0, y, &left, info);
+    cx = buf.set_str(cx, y, &" ".repeat(pad), info);
+    buf.set_str(cx, y, &right, Style::new(t.accent, t.bg));
 }
 
 fn target_of(entry: &Entry) -> String {
@@ -817,13 +609,11 @@ fn target_of(entry: &Entry) -> String {
 
 // ---- helpers ---------------------------------------------------------------
 
-fn draw_vline(out: &mut impl Write, x: u16, top: u16, height: usize, t: &Theme) -> io::Result<()> {
-    queue!(out, SetBackgroundColor(t.bg), SetForegroundColor(t.border))?;
+fn draw_vline(buf: &mut Buffer, x: usize, top: usize, height: usize, t: &Theme) {
+    let style = Style::new(t.border, t.bg);
     for row in 0..height {
-        queue!(out, MoveTo(x, top + row as u16), Print("│"))?;
+        buf.set_char(x, top + row, '│', style);
     }
-    queue!(out, ResetColor)?;
-    Ok(())
 }
 
 /// Index of the first visible row, chosen to keep the focused row vertically
@@ -839,11 +629,68 @@ fn scroll_begin(pointer: usize, len: usize, height: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::scroll_begin;
+    use super::{render, scroll_begin};
+    use crate::app::App;
+    use crate::config::Settings;
+    use crate::screen::{flush, Buffer, Style};
+    use crossterm::style::Color;
+
+    /// Rendering then flushing must emit a synchronized-update frame containing
+    /// the directory content, with no screen/line clears (the flicker fix), and
+    /// must no-op on a terminal too small to draw.
+    #[test]
+    fn render_then_flush_emits_clean_frame_with_content() {
+        let dir = std::env::temp_dir().join(format!("rr_render_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hello.txt"), b"hi there").unwrap();
+
+        let mut app = App::new(dir.clone(), Settings::default());
+        app.prepare_view();
+
+        let mut buf = Buffer::new(80, 24, Style::new(Color::Reset, Color::Reset));
+        let _cursor = render(&mut buf, &app);
+
+        let mut out: Vec<u8> = Vec::new();
+        flush(&mut out, None, &buf).unwrap();
+        let s = String::from_utf8_lossy(&out);
+
+        let begin = s.find("\u{1b}[?2026h").expect("begin synchronized update");
+        let end = s.rfind("\u{1b}[?2026l").expect("end synchronized update");
+        assert!(begin < end);
+        assert!(s.contains("hello.txt"), "directory content rendered");
+        // The flicker fix: a frame must never clear the screen or a line.
+        assert!(!s.contains("\u{1b}[2J"), "must not clear the whole screen");
+        assert!(!s.contains("\u{1b}[2K"), "must not clear a line");
+        assert!(!s.contains("\u{1b}[K"), "must not clear to end of line");
+
+        // A terminal too small to draw renders no cursor and panics on nothing.
+        let mut tiny = Buffer::new(2, 2, Style::new(Color::Reset, Color::Reset));
+        assert!(render(&mut tiny, &app).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_flush_emits_only_changed_cells() {
+        // Two near-identical frames differing in one cell -> the diff must emit
+        // far less than a full-screen repaint.
+        let base = Style::new(Color::White, Color::Black);
+        let mut a = Buffer::new(80, 24, base);
+        a.set_str(0, 0, "hello world", base);
+        let mut b = Buffer::new(80, 24, base);
+        b.set_str(0, 0, "hello world", base);
+        b.set_str(0, 5, "X", Style::new(Color::Red, Color::Black));
+
+        let mut out: Vec<u8> = Vec::new();
+        flush(&mut out, Some(&a), &b).unwrap();
+        // Only the single changed cell (plus sync wrap + one move + style) is sent.
+        assert!(out.len() < 64, "incremental diff should be tiny, got {}", out.len());
+        assert!(String::from_utf8_lossy(&out).contains('X'));
+    }
 
     #[test]
     fn centers_focused_row_with_room_on_both_sides() {
-        // Long list, cursor in the middle: focused row sits at height/2.
         let height = 20;
         let len = 100;
         let pointer = 50;
@@ -854,11 +701,8 @@ mod tests {
     #[test]
     fn clamps_at_top_and_bottom() {
         let (len, height) = (100, 20);
-        // Near the top: can't center, cursor stays at its real row.
         assert_eq!(scroll_begin(3, len, height), 0);
-        // Near the bottom: scrolled to the last page, cursor moves toward bottom.
         assert_eq!(scroll_begin(99, len, height), len - height);
-        // Short list: no scrolling at all.
         assert_eq!(scroll_begin(5, 10, height), 0);
     }
 }

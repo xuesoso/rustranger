@@ -343,6 +343,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // deliberately mutate a few fields of a default
     fn default_config_template_parses_to_defaults() {
         // Applying the generated template to a mutated Settings restores defaults,
         // which also proves every key/value in the template is valid and current.
