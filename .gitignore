@@ -1,0 +1,39 @@
+# ---- Rust ----
+/target/
+**/*.rs.bk          # rustfmt backups
+*.pdb               # debug symbols (MSVC)
+# Cargo.lock is intentionally tracked (this is a binary, not a library).
+
+# ---- Python (legacy ranger tree) ----
+*.pyc
+*.pyo
+__pycache__/
+/ranger_fm.egg-info
+.pytest_cache
+/pytestdebug.log
+
+# ---- build / dist intermediates ----
+/build
+/build_scripts
+/dist
+/.cache
+/install_log.txt
+/doc/ranger.1.html
+
+# ---- editor / OS junk ----
+*~
+*.orig
+*.swp
+*.swo
+*.bak
+*.tmp
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- agent / session ----
+.claude/
+
+# ---- misc ----
+/stuff/*

@@ -1,0 +1,19 @@
+[package]
+name = "rustranger"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal standalone Rust file-browser TUI (a ranger-inspired rewrite)"
+license = "GPL-3.0"
+
+[[bin]]
+name = "rustranger"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.28"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
