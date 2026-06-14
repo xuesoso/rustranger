@@ -8,6 +8,7 @@ mod ops;
 mod preview;
 mod state;
 mod tab;
+mod theme;
 mod ui;
 mod util;
 
@@ -24,23 +25,86 @@ struct Args {
     start: PathBuf,
     /// File-picker mode: write the chosen file's path here and exit.
     choosefile: Option<PathBuf>,
+    /// Settings overrides from the command line, applied on top of the config file.
+    overrides: Vec<(String, String)>,
 }
+
+const HELP: &str = "\
+usage: rustranger [PATH] [options]
+       rustranger gen-config     write a default config.toml (only if missing)
+
+  --choosefile FILE         file-picker mode: write the chosen path and exit
+  --theme NAME              default|gruvbox-dark|gruvbox-light|solarized-dark|
+                            solarized-light|nord|dracula|one-light|ayu-light
+  --sort KEY                natural|basename|size|mtime|ctime|atime|type|extension|random
+  --reverse                 reverse the sort order
+  --show-date               show the date column
+  --no-date                 hide the date column
+  --time-type TYPE          modified|created|changed|accessed
+  --time-format FMT         date (YYYY/MM/DD) | datetime (YYYY/MM/DD/HH/MM)
+  --size-format FMT         human|binary|bytes
+  --set KEY=VALUE           override any config.toml setting (repeatable)
+  -h, --help                show this help
+
+Persistent defaults live in ~/.config/rustranger/config.toml; the flags above
+override them for this run.";
 
 fn parse_args() -> Args {
     let mut start: Option<PathBuf> = None;
     let mut choosefile: Option<PathBuf> = None;
+    let mut overrides: Vec<(String, String)> = Vec::new();
     let mut it = std::env::args().skip(1);
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--choosefile" | "--selectfile" => choosefile = it.next().map(PathBuf::from),
-            s if s.starts_with("--choosefile=") => {
-                choosefile = s.split_once('=').map(|(_, v)| PathBuf::from(v))
-            }
+    while let Some(raw) = it.next() {
+        // Support both "--flag value" and "--flag=value" forms.
+        let (flag, inline_val) = match raw.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
+            _ => (raw.clone(), None),
+        };
+        let mut take_val = || inline_val.clone().or_else(|| it.next());
+        match flag.as_str() {
+            "--choosefile" | "--selectfile" => choosefile = take_val().map(PathBuf::from),
             "-h" | "--help" => {
-                println!("usage: rustranger [PATH] [--choosefile FILE]");
+                println!("{}", HELP);
                 std::process::exit(0);
             }
-            s if !s.starts_with('-') && start.is_none() => start = Some(PathBuf::from(s)),
+            "--theme" => {
+                if let Some(v) = take_val() {
+                    overrides.push(("theme".into(), v));
+                }
+            }
+            "--sort" => {
+                if let Some(v) = take_val() {
+                    overrides.push(("sort".into(), v));
+                }
+            }
+            "--reverse" => overrides.push(("sort_reverse".into(), "true".into())),
+            "--show-date" | "--show-time" => overrides.push(("show_date".into(), "true".into())),
+            "--no-date" | "--no-time" | "--hide-date" => {
+                overrides.push(("show_date".into(), "false".into()))
+            }
+            "--time-type" => {
+                if let Some(v) = take_val() {
+                    overrides.push(("time_type".into(), v));
+                }
+            }
+            "--time-format" => {
+                if let Some(v) = take_val() {
+                    overrides.push(("time_format".into(), v));
+                }
+            }
+            "--size-format" => {
+                if let Some(v) = take_val() {
+                    overrides.push(("size_format".into(), v));
+                }
+            }
+            "--set" | "-s" => {
+                if let Some((k, v)) = take_val().and_then(|kv| {
+                    kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
+                }) {
+                    overrides.push((k, v));
+                }
+            }
+            s if !s.starts_with('-') && start.is_none() => start = Some(PathBuf::from(raw)),
             _ => {}
         }
     }
@@ -48,12 +112,23 @@ fn parse_args() -> Args {
     Args {
         start: start.canonicalize().unwrap_or(start),
         choosefile,
+        overrides,
     }
 }
 
 fn main() -> io::Result<()> {
+    // Subcommands are recognized only as the first argument.
+    if std::env::args().nth(1).as_deref() == Some("gen-config") {
+        return gen_config();
+    }
+
     let args = parse_args();
-    let mut app = App::new(args.start);
+    // Config file defaults, then command-line overrides on top.
+    let mut settings = config::Settings::load();
+    for (key, value) in &args.overrides {
+        settings.set_field(key, value);
+    }
+    let mut app = App::new(args.start, settings);
     app.choosefile = args.choosefile;
 
     setup_terminal()?;
@@ -68,6 +143,22 @@ fn main() -> io::Result<()> {
 
     restore_terminal()?;
     result
+}
+
+/// `gen-config` subcommand: write a default config.toml, but only if one does not
+/// already exist (never overwrites).
+fn gen_config() -> io::Result<()> {
+    match config::generate_default_config()? {
+        config::GenConfig::Created(p) => println!("Wrote default config to {}", p.display()),
+        config::GenConfig::Exists(p) => {
+            println!("Config already exists at {} (left unchanged).", p.display())
+        }
+        config::GenConfig::NoConfigDir => {
+            eprintln!("Could not determine the config directory (set $HOME or $XDG_CONFIG_HOME).");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
 }
 
 fn setup_terminal() -> io::Result<()> {
@@ -166,8 +257,15 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
         return;
     }
 
-    // A message is cleared on the next keypress.
+    // The help overlay captures input (scroll / close) while open.
+    if app.help.is_some() {
+        handle_help_key(app, key);
+        return;
+    }
+
+    // A message (and any open key-chain hint menu) is cleared on the next keypress.
     app.message = None;
+    app.menu = None;
 
     // Numeric prefix: accumulate a repeat count (1-9, then any digit).
     if pending.is_none() {
@@ -200,15 +298,24 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
                     'T' => app.tab_prev(),
                     _ => {}
                 },
+                // Sort: lowercase sorts ascending, SHIFTed uppercase descending.
                 'o' => match c {
-                    's' => app.set_sort(SortKey::Size),
-                    'n' => app.set_sort(SortKey::Natural),
-                    'b' => app.set_sort(SortKey::Basename),
-                    'm' => app.set_sort(SortKey::Mtime),
-                    'c' => app.set_sort(SortKey::Ctime),
-                    'a' => app.set_sort(SortKey::Atime),
-                    't' => app.set_sort(SortKey::Type),
-                    'e' => app.set_sort(SortKey::Extension),
+                    's' => app.set_sort_order(SortKey::Size, false),
+                    'S' => app.set_sort_order(SortKey::Size, true),
+                    'n' => app.set_sort_order(SortKey::Natural, false),
+                    'N' => app.set_sort_order(SortKey::Natural, true),
+                    'b' => app.set_sort_order(SortKey::Basename, false),
+                    'B' => app.set_sort_order(SortKey::Basename, true),
+                    'm' => app.set_sort_order(SortKey::Mtime, false),
+                    'M' => app.set_sort_order(SortKey::Mtime, true),
+                    'c' => app.set_sort_order(SortKey::Ctime, false),
+                    'C' => app.set_sort_order(SortKey::Ctime, true),
+                    'a' => app.set_sort_order(SortKey::Atime, false),
+                    'A' => app.set_sort_order(SortKey::Atime, true),
+                    't' => app.set_sort_order(SortKey::Type, false),
+                    'T' => app.set_sort_order(SortKey::Type, true),
+                    'e' => app.set_sort_order(SortKey::Extension, false),
+                    'E' => app.set_sort_order(SortKey::Extension, true),
                     'r' => app.toggle_sort_reverse(),
                     'z' => app.set_sort(SortKey::Random),
                     'f' => app.toggle_dirs_first(),
@@ -219,11 +326,11 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
                         app.copy()
                     }
                 }
-                'd' => match c {
-                    'd' => app.cut(),
-                    'D' => app.request_delete(),
-                    _ => {}
-                },
+                'd' => {
+                    if c == 'd' {
+                        app.cut()
+                    }
+                }
                 'p' => match c {
                     'p' => app.paste(),
                     'l' => app.paste_links(true),
@@ -274,8 +381,14 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
         (KeyCode::Char('H'), false) => app.history_back(),
         (KeyCode::Char('L'), false) => app.history_forward(),
         (KeyCode::Char('t'), false) => app.toggle_tag(),
-        (KeyCode::Char('m'), false) => *pending = Some('m'),
-        (KeyCode::Char('`'), false) | (KeyCode::Char('\''), false) => *pending = Some('`'),
+        (KeyCode::Char('m'), false) => {
+            *pending = Some('m');
+            app.menu = Some(app.bookmark_menu(true));
+        }
+        (KeyCode::Char('`'), false) | (KeyCode::Char('\''), false) => {
+            *pending = Some('`');
+            app.menu = Some(app.bookmark_menu(false));
+        }
         (KeyCode::Char('j'), false) | (KeyCode::Down, false) => app.move_cursor(n as isize),
         (KeyCode::Char('k'), false) | (KeyCode::Up, false) => app.move_cursor(-(n as isize)),
         (KeyCode::Char('d'), true) => app.move_cursor(10),
@@ -283,6 +396,7 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
         (KeyCode::Char('h'), false) | (KeyCode::Left, false) => app.ascend(),
         (KeyCode::Char('l'), false) | (KeyCode::Right, false) | (KeyCode::Enter, _) => app.enter(),
         (KeyCode::Char('G'), false) => app.move_to_bottom(),
+        (KeyCode::Char('D'), false) => app.request_delete(),
         (KeyCode::Char('z'), false) => app.toggle_hidden(),
         (KeyCode::Char('J'), false) => app.scroll_preview(3),
         (KeyCode::Char('K'), false) => app.scroll_preview(-3),
@@ -300,13 +414,35 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
         (KeyCode::Char('N'), false) => app.search_next(false),
         (KeyCode::Char('S'), false) => app.open_console(':', "shell "),
         (KeyCode::Char('r'), false) => app.open_console(':', "open_with "),
-        (KeyCode::Char('c'), false) => *pending = Some('c'),
-        (KeyCode::Char('g'), false) => *pending = Some('g'),
-        (KeyCode::Char('o'), false) => *pending = Some('o'),
-        (KeyCode::Char('y'), false) => *pending = Some('y'),
-        (KeyCode::Char('d'), false) => *pending = Some('d'),
-        (KeyCode::Char('p'), false) => *pending = Some('p'),
-        (KeyCode::Char('u'), false) => *pending = Some('u'),
+        (KeyCode::Char('?'), false) => app.help = Some(0),
+        (KeyCode::Char('c'), false) => {
+            *pending = Some('c');
+            app.menu = Some(app::KeyMenu::change());
+        }
+        (KeyCode::Char('g'), false) => {
+            *pending = Some('g');
+            app.menu = Some(app::KeyMenu::go());
+        }
+        (KeyCode::Char('o'), false) => {
+            *pending = Some('o');
+            app.menu = Some(app::KeyMenu::sort());
+        }
+        (KeyCode::Char('y'), false) => {
+            *pending = Some('y');
+            app.menu = Some(app::KeyMenu::yank());
+        }
+        (KeyCode::Char('d'), false) => {
+            *pending = Some('d');
+            app.menu = Some(app::KeyMenu::cut());
+        }
+        (KeyCode::Char('p'), false) => {
+            *pending = Some('p');
+            app.menu = Some(app::KeyMenu::paste());
+        }
+        (KeyCode::Char('u'), false) => {
+            *pending = Some('u');
+            app.menu = Some(app::KeyMenu::un());
+        }
         _ => {}
     }
 }
@@ -328,6 +464,28 @@ fn handle_console_key(app: &mut App, key: KeyEvent) {
         (KeyCode::End, _) | (KeyCode::Char('e'), true) => console.end(),
         (KeyCode::Char('u'), true) => console.clear_to_start(),
         (KeyCode::Char(c), false) => console.insert(c),
+        _ => {}
+    }
+}
+
+/// Scroll or close the help overlay. Scroll is clamped to the help text length;
+/// the renderer clamps further to the visible viewport.
+fn handle_help_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let cur = app.help.unwrap_or(0);
+    let last = ui::help_len().saturating_sub(1);
+    let set = |app: &mut App, v: usize| app.help = Some(v.min(last));
+    match (key.code, ctrl) {
+        (KeyCode::Char('q'), false)
+        | (KeyCode::Char('Q'), false)
+        | (KeyCode::Char('?'), false)
+        | (KeyCode::Esc, _) => app.help = None,
+        (KeyCode::Char('j'), false) | (KeyCode::Down, _) => set(app, cur + 1),
+        (KeyCode::Char('k'), false) | (KeyCode::Up, _) => app.help = Some(cur.saturating_sub(1)),
+        (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => set(app, cur + 10),
+        (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => app.help = Some(cur.saturating_sub(10)),
+        (KeyCode::Char('g'), false) | (KeyCode::Home, _) => app.help = Some(0),
+        (KeyCode::Char('G'), false) | (KeyCode::End, _) => set(app, last),
         _ => {}
     }
 }

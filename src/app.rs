@@ -1,7 +1,7 @@
 // Central application state. Phase 1: a directory cache + cursor navigation.
 // Later phases add tabs, marking, file ops, console, etc.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::Settings;
@@ -21,6 +21,96 @@ use crate::tab::Tab;
 /// A pending action awaiting y/n confirmation in the status bar.
 pub enum Confirm {
     Delete(Vec<PathBuf>),
+}
+
+/// A transient hint overlay shown while a multi-key prefix is pending, listing
+/// the keys that complete the chord (ranger pops up the same when you press `o`,
+/// `g`, etc.). Owns its rows so dynamic menus (bookmarks) can be built on the fly.
+pub struct KeyMenu {
+    pub title: String,
+    /// (key, description) rows, in display order.
+    pub items: Vec<(String, String)>,
+}
+
+impl KeyMenu {
+    fn from_static(title: &str, items: &[(&str, &str)]) -> KeyMenu {
+        KeyMenu {
+            title: title.to_string(),
+            items: items
+                .iter()
+                .map(|(k, d)| (k.to_string(), d.to_string()))
+                .collect(),
+        }
+    }
+
+    /// The sort menu shown after pressing `o`. Following ranger, the lowercase
+    /// key sorts ascending and the SHIFTed (uppercase) key sorts descending.
+    pub fn sort() -> KeyMenu {
+        KeyMenu::from_static(
+            "sort by  (UPPERCASE = reversed)",
+            &[
+                ("s/S", "size"),
+                ("n/N", "natural"),
+                ("b/B", "basename"),
+                ("m/M", "mtime"),
+                ("c/C", "ctime"),
+                ("a/A", "atime"),
+                ("t/T", "type"),
+                ("e/E", "extension"),
+                ("z", "random"),
+                ("r", "toggle reverse"),
+                ("f", "toggle dirs-first"),
+            ],
+        )
+    }
+
+    /// The `g` (go) navigation menu.
+    pub fn go() -> KeyMenu {
+        KeyMenu::from_static(
+            "go",
+            &[
+                ("g", "top"),
+                ("h", "home (~)"),
+                ("/", "root (/)"),
+                ("n", "new tab"),
+                ("t", "next tab"),
+                ("T", "previous tab"),
+            ],
+        )
+    }
+
+    /// The `y` (yank/copy) menu.
+    pub fn yank() -> KeyMenu {
+        KeyMenu::from_static("yank", &[("y", "copy selection")])
+    }
+
+    /// The `d` (cut) menu.
+    pub fn cut() -> KeyMenu {
+        KeyMenu::from_static("cut", &[("d", "cut selection")])
+    }
+
+    /// The `p` (paste) menu.
+    pub fn paste() -> KeyMenu {
+        KeyMenu::from_static(
+            "paste",
+            &[
+                ("p", "paste"),
+                ("l", "paste symlink (relative)"),
+                ("L", "paste symlink (absolute)"),
+                ("h", "paste hardlink"),
+            ],
+        )
+    }
+
+    /// The `u` (un-) menu.
+    pub fn un() -> KeyMenu {
+        KeyMenu::from_static("un-", &[("v", "clear marks")])
+    }
+
+    /// The `c` (change) menu.
+    pub fn change() -> KeyMenu {
+        KeyMenu::from_static("change", &[("w", "rename")])
+    }
 }
 
 pub struct App {
@@ -45,6 +135,10 @@ pub struct App {
     pub visual: bool,
     /// A pending confirmation prompt.
     pub confirm: Option<Confirm>,
+    /// A transient key-chain hint menu (e.g. sort options after pressing `o`).
+    pub menu: Option<KeyMenu>,
+    /// The scrollable help overlay, holding its scroll offset when open.
+    pub help: Option<usize>,
     pub bookmarks: Bookmarks,
     pub tags: Tags,
     /// Active `:`/`/` console line editor, if any.
@@ -58,10 +152,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(start: PathBuf) -> App {
+    pub fn new(start: PathBuf, settings: Settings) -> App {
         let dir = data_dir();
         let mut app = App {
-            settings: Settings::load(),
+            settings,
             dirs: HashMap::new(),
             tabs: vec![Tab::new(start.clone())],
             current_tab: 0,
@@ -75,8 +169,10 @@ impl App {
             jobs: Vec::new(),
             visual: false,
             confirm: None,
+            menu: None,
+            help: None,
             bookmarks: Bookmarks::load(dir.join("bookmarks")),
-            tags: Tags::load(dir.join("tagged")),
+            tags: Tags::new(),
             console: None,
             search_term: String::new(),
             pending_run: None,
@@ -98,6 +194,14 @@ impl App {
             dir.load(&self.settings);
             self.dirs.insert(path.to_path_buf(), dir);
         }
+    }
+
+    /// Drop `path` and everything under it from the directory and preview caches.
+    /// Called when a path is removed so a later recreation of the same path is not
+    /// served from a stale cached listing.
+    fn invalidate_cache(&mut self, path: &Path) {
+        self.dirs.retain(|p, _| p != path && !p.starts_with(path));
+        self.previews.retain(|p, _| p != path && !p.starts_with(path));
     }
 
     pub fn current_dir(&self) -> &Dir {
@@ -145,6 +249,13 @@ impl App {
         match selected {
             Some((path, true, true, _, _, _)) => {
                 self.ensure_dir(&path);
+                // The previewed directory may have changed on disk since it was
+                // cached (e.g. deleted and recreated, or modified externally);
+                // refresh it if its mtime moved so the preview isn't stale.
+                let settings = self.settings.clone();
+                if let Some(dir) = self.dirs.get_mut(&path) {
+                    dir.reload_if_outdated(&settings);
+                }
             }
             Some((path, false, _, ftype, size, mtime)) if self.settings.preview_files => {
                 use crate::fs::FType;
@@ -287,6 +398,19 @@ impl App {
         self.refresh_all();
     }
 
+    /// Set the sort key *and* direction in one step (ranger's `os`/`oS` chords:
+    /// lowercase = ascending, SHIFTed uppercase = descending).
+    pub fn set_sort_order(&mut self, key: SortKey, reverse: bool) {
+        self.settings.sort = key;
+        self.settings.sort_reverse = reverse;
+        self.message = Some(format!(
+            "sort: {} ({})",
+            key.name(),
+            if reverse { "reversed" } else { "normal" }
+        ));
+        self.refresh_all();
+    }
+
     pub fn toggle_sort_reverse(&mut self) {
         self.settings.sort_reverse = !self.settings.sort_reverse;
         self.message = Some(format!("reverse: {}", self.settings.sort_reverse));
@@ -421,10 +545,19 @@ impl App {
     }
 
     fn perform_delete(&mut self, targets: Vec<PathBuf>) {
+        // Decide which entry to focus afterwards (nearest survivor, preferring the
+        // one above) while the to-be-deleted entries are still in the listing.
+        let deleted: HashSet<PathBuf> = targets.iter().cloned().collect();
+        let anchor = self.current_dir().survivor_name(&deleted);
+
         let mut errors = 0;
         for t in &targets {
             if fileops::delete_path(t).is_err() {
                 errors += 1;
+            } else {
+                // Drop any cached listing/preview for the removed path so a later
+                // `mkdir` of the same name doesn't show the old contents.
+                self.invalidate_cache(t);
             }
         }
         self.message = Some(if errors == 0 {
@@ -432,7 +565,13 @@ impl App {
         } else {
             format!("{} delete(s) failed", errors)
         });
-        self.reload_dir(&self.cwd());
+        let cwd = self.cwd();
+        self.reload_dir(&cwd);
+        // Move the cursor to the chosen survivor (the dir may be empty, in which
+        // case there is nothing to select and the cursor stays at 0).
+        if let Some(name) = anchor {
+            self.current_dir_mut().select_name(&name);
+        }
     }
 
     // ---- background job ticking ------------------------------------------
@@ -542,6 +681,24 @@ impl App {
     }
 
     // ---- bookmarks --------------------------------------------------------
+
+    /// Build the hint menu listing current bookmarks (shown after `m` or `` ` ``).
+    pub fn bookmark_menu(&self, setting: bool) -> KeyMenu {
+        let title = if setting { "set bookmark" } else { "go to bookmark" };
+        let mut items: Vec<(String, String)> = self
+            .bookmarks
+            .map
+            .iter()
+            .map(|(k, p)| (k.to_string(), p.display().to_string()))
+            .collect();
+        if items.is_empty() {
+            items.push((String::new(), "(no bookmarks set)".to_string()));
+        }
+        KeyMenu {
+            title: title.to_string(),
+            items,
+        }
+    }
 
     pub fn set_bookmark(&mut self, key: char) {
         let cwd = self.cwd();
@@ -797,12 +954,71 @@ impl App {
             "preview_files" => self.settings.preview_files = parse_bool(value),
             "confirm_on_delete" => self.settings.confirm_on_delete = parse_bool(value),
             "draw_borders" => self.settings.draw_borders = parse_bool(value),
-            "scroll_offset" => {
-                if let Ok(n) = value.parse() {
-                    self.settings.scroll_offset = n;
+            "show_date" | "show_time" => self.settings.show_date = parse_bool(value),
+            "time_type" => {
+                if let Some(t) = crate::config::TimeType::from_str(value) {
+                    self.settings.time_type = t;
                 }
             }
+            "time_format" => {
+                if let Some(f) = crate::config::TimeFormat::from_str(value) {
+                    self.settings.time_format = f;
+                }
+            }
+            "size_format" => {
+                if let Some(f) = crate::config::SizeFormat::from_str(value) {
+                    self.settings.size_format = f;
+                }
+            }
+            "theme" => match crate::theme::Theme::by_name(value) {
+                Some(t) => {
+                    self.settings.theme = t;
+                    self.message = Some(format!("theme: {}", value));
+                }
+                None => {
+                    self.message =
+                        Some(format!("unknown theme '{}' ({})", value, crate::theme::Theme::names()))
+                }
+            },
             other => self.message = Some(format!("set: unknown option {}", other)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Settings;
+
+    /// Deleting a directory and recreating it with the same name must not show the
+    /// old contents in the preview (the cached listing has to be invalidated).
+    #[test]
+    fn delete_then_recreate_dir_does_not_show_stale_preview() {
+        let base = std::env::temp_dir().join(format!("rr_app_stale_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("test/sub")).unwrap();
+        std::fs::write(base.join("test/file"), b"x").unwrap();
+
+        let mut app = App::new(base.clone(), Settings::default());
+        app.current_dir_mut().select_name("test");
+        app.prepare_view();
+        // The preview cached "test" with its two children.
+        assert_eq!(app.get_cached(&base.join("test")).map(|d| d.len()), Some(2));
+
+        // Delete "test" through the app: its cache entry must be evicted.
+        app.perform_delete(vec![base.join("test")]);
+        assert!(app.get_cached(&base.join("test")).is_none());
+
+        // Recreate an empty "test" and re-render.
+        std::fs::create_dir_all(base.join("test")).unwrap();
+        let cwd = app.cwd();
+        app.reload_dir(&cwd);
+        app.current_dir_mut().select_name("test");
+        app.prepare_view();
+
+        // The preview now reflects the empty recreated directory, not the old one.
+        assert_eq!(app.get_cached(&base.join("test")).map(|d| d.len()), Some(0));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

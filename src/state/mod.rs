@@ -4,7 +4,7 @@ pub mod tags;
 
 use std::path::PathBuf;
 
-/// Directory for persistent data (bookmarks, tags), following XDG.
+/// Directory for persistent data (bookmarks), following XDG.
 pub fn data_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
         PathBuf::from(d).join("rustranger")

@@ -19,6 +19,23 @@ pub fn human_size(byte_count: u64) -> String {
     format!("{}{}", s, prefixes[ind])
 }
 
+/// Human-readable byte size using binary/IEC (1024-based) units: 1.5K, 1.05M.
+pub fn human_size_binary(byte_count: u64) -> String {
+    if byte_count == 0 {
+        return "0".to_string();
+    }
+    let prefixes = ["B", "K", "M", "G", "T", "P"];
+    let unit = 1024.0_f64;
+    let mut value = byte_count as f64;
+    let mut ind = 0;
+    while value >= unit && ind < prefixes.len() - 1 {
+        value /= unit;
+        ind += 1;
+    }
+    let sig = if value < 1000.0 { 3 } else { 4 };
+    format!("{}{}", format_sig(value, sig), prefixes[ind])
+}
+
 /// Format a float with `sig` significant figures, trimming trailing zeros (like %g).
 fn format_sig(value: f64, sig: usize) -> String {
     if value == 0.0 {
@@ -122,6 +139,28 @@ unsafe fn cstr_to_string(ptr: *const libc::c_char) -> Option<String> {
     Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// Format a unix timestamp (seconds since the epoch) as a local-time date string:
+/// "YYYY/MM/DD", or "YYYY/MM/DD/HH/MM" when `with_time` is set. Uses libc's
+/// `localtime_r` so the local timezone and DST are applied (no chrono dependency).
+pub fn format_time(secs: i64, with_time: bool) -> String {
+    unsafe {
+        let t = secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return String::new();
+        }
+        let (year, month, day) = (tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+        if with_time {
+            format!(
+                "{:04}/{:02}/{:02}/{:02}/{:02}",
+                year, month, day, tm.tm_hour, tm.tm_min
+            )
+        } else {
+            format!("{:04}/{:02}/{:02}", year, month, day)
+        }
+    }
+}
+
 /// Display width of a string, counting wide (East-Asian) codepoints as 2 columns.
 /// A compact approximation of ranger/ext/widestring.py good enough for layout.
 pub fn display_width(s: &str) -> usize {
@@ -204,6 +243,15 @@ mod tests {
         assert_eq!(human_size(54), "54B");
         assert_eq!(human_size(1500), "1.5k");
         assert_eq!(human_size(1024 * 1024), "1.05M");
+    }
+
+    #[test]
+    fn human_size_binary_is_1024_based() {
+        assert_eq!(human_size_binary(0), "0");
+        assert_eq!(human_size_binary(512), "512B");
+        assert_eq!(human_size_binary(1024), "1K");
+        assert_eq!(human_size_binary(1024 * 1024), "1M");
+        assert_eq!(human_size_binary(1536), "1.5K");
     }
 
     #[test]

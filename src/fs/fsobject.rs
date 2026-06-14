@@ -4,6 +4,7 @@
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FType {
@@ -35,6 +36,9 @@ pub struct Entry {
     pub mtime: i64,
     pub ctime: i64,
     pub atime: i64,
+    /// Creation time (birthtime where the platform/FS supports it; falls back to
+    /// mtime otherwise). On macOS this is the real file-creation time.
+    pub created: i64,
     pub executable: bool,
     pub marked: bool,
 }
@@ -58,6 +62,13 @@ impl Entry {
                 let ftype = classify(&meta);
                 let mode = meta.mode();
                 let executable = matches!(ftype, FType::File) && (mode & 0o111 != 0);
+                // Real creation time where available (macOS birthtime), else mtime.
+                let created = meta
+                    .created()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or_else(|| meta.mtime());
 
                 Entry {
                     path,
@@ -73,6 +84,7 @@ impl Entry {
                     mtime: meta.mtime(),
                     ctime: meta.ctime(),
                     atime: meta.atime(),
+                    created,
                     executable,
                     marked: false,
                 }
@@ -91,6 +103,7 @@ impl Entry {
                 mtime: 0,
                 ctime: 0,
                 atime: 0,
+                created: 0,
                 executable: false,
                 marked: false,
             },
