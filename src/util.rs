@@ -193,7 +193,8 @@ pub fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-fn char_width(ch: char) -> usize {
+/// Display width of a single character: 0 (control/combining), 1, or 2 (wide).
+pub fn char_width(ch: char) -> usize {
     let c = ch as u32;
     if c == 0 {
         return 0;

@@ -1,17 +1,3 @@
-mod app;
-mod config;
-mod console;
-mod fs;
-mod image;
-mod open;
-mod ops;
-mod preview;
-mod state;
-mod tab;
-mod theme;
-mod ui;
-mod util;
-
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -19,7 +5,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 
-use app::App;
+// Modules live in the library crate (src/lib.rs); the binary just drives them.
+use rustranger::app::{self, App};
+use rustranger::{config, fs, open, ui};
 
 /// Internal pending-key sentinel for the `um{key}` chord (awaiting the bookmark
 /// key to delete). Not a typeable key, so it never collides with a real prefix.
@@ -168,42 +156,84 @@ fn gen_config() -> io::Result<()> {
 fn setup_terminal() -> io::Result<()> {
     enable_raw_mode()?;
     let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen, cursor::Hide)?;
+    // DisableLineWrap: the diff renderer may write the last cell of a row, and
+    // autowrap there would scroll/shift the screen.
+    execute!(out, EnterAlternateScreen, cursor::Hide, crossterm::terminal::DisableLineWrap)?;
     Ok(())
 }
 
 fn restore_terminal() -> io::Result<()> {
     let mut out = io::stdout();
-    execute!(out, cursor::Show, LeaveAlternateScreen)?;
+    execute!(out, crossterm::terminal::EnableLineWrap, cursor::Show, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     Ok(())
 }
 
 fn run(app: &mut App) -> io::Result<()> {
+    use rustranger::screen::{self, Buffer, Style};
     let mut out = io::stdout();
     let mut pending: Option<char> = None;
     let mut count: Option<usize> = None;
+    // Double-buffered cell grid: render into `cur`, emit only the cells that
+    // differ from the previously displayed `prev`, then swap. This keeps each
+    // frame's output tiny (a cursor move repaints a couple of rows, not the
+    // whole screen), which is what stops the flicker over tmux/SSH.
+    let mut frame: Vec<u8> = Vec::with_capacity(32 * 1024);
+    let default = Style::new(crossterm::style::Color::Reset, crossterm::style::Color::Reset);
+    let mut cur = Buffer::new(0, 0, default);
+    let mut prev: Option<Buffer> = None;
     while !app.quit {
         app.prepare_view();
-        ui::draw(&mut out, app)?;
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
+            let (cols, rows) = (cols as usize, rows as usize);
+            // On first paint / resize, drop the diff baseline and clear once (the
+            // only clear we ever emit — resize is rare, so its repaint is fine).
+            if cur.cols != cols || cur.rows != rows {
+                cur = Buffer::new(cols, rows, default);
+                prev = None;
+                frame.clear();
+                screen::clear(&mut frame, default)?;
+                out.write_all(&frame)?;
+            }
+            let cursor = ui::render(&mut cur, app);
+            frame.clear();
+            screen::flush(&mut frame, prev.as_ref(), &cur)?;
+            // Cursor: shown at the console edit position, hidden otherwise.
+            match cursor {
+                Some((cx, cy)) => {
+                    crossterm::queue!(frame, crossterm::cursor::MoveTo(cx, cy), crossterm::cursor::Show)?
+                }
+                None => crossterm::queue!(frame, crossterm::cursor::Hide)?,
+            }
+            out.write_all(&frame)?;
+            out.flush()?;
+            prev = Some(cur.clone());
+        }
 
-        if app.jobs_active() {
-            // Poll with a short timeout so background-copy progress keeps updating.
-            if event::poll(std::time::Duration::from_millis(80))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Release {
-                        handle_key(app, key, &mut pending, &mut count);
-                    }
-                }
-            }
-            app.tick_jobs();
+        // Wait for input: poll briefly when background jobs run (so progress
+        // updates), otherwise block until a key arrives.
+        let have_event = if app.jobs_active() {
+            event::poll(std::time::Duration::from_millis(80))?
         } else {
-            match event::read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    handle_key(app, key, &mut pending, &mut count)
+            true
+        };
+        if have_event {
+            handle_event(app, event::read()?, &mut pending, &mut count);
+            // Coalesce a burst: handle every event already queued before the next
+            // redraw, so fast key-repeat (which backs up behind a slow tmux/SSH
+            // redraw) collapses into ONE frame instead of one frame per key. This
+            // self-paces rendering to whatever the display can keep up with.
+            while event::poll(std::time::Duration::ZERO)? {
+                handle_event(app, event::read()?, &mut pending, &mut count);
+                // Don't keep swallowing keys once a key has asked to launch an
+                // external program or quit (those keys belong to the next state).
+                if app.pending_run.is_some() || app.quit {
+                    break;
                 }
-                _ => {}
             }
+        }
+        if app.jobs_active() {
+            app.tick_jobs();
         }
 
         // Run any external program requested this iteration.
@@ -213,6 +243,16 @@ fn run(app: &mut App) -> io::Result<()> {
     }
     out.flush()?;
     Ok(())
+}
+
+/// Dispatch a single terminal event (ignores key releases and non-key events;
+/// resize is handled implicitly since the loop re-queries the size each frame).
+fn handle_event(app: &mut App, ev: Event, pending: &mut Option<char>, count: &mut Option<usize>) {
+    if let Event::Key(key) = ev {
+        if key.kind != KeyEventKind::Release {
+            handle_key(app, key, pending, count);
+        }
+    }
 }
 
 /// Run an external program. Blocking programs (editors/pager/shell) suspend the
@@ -244,7 +284,7 @@ fn run_external(out: &mut io::Stdout, req: open::RunRequest) -> io::Result<()> {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &mut Option<usize>) {
-    use crate::fs::sort::SortKey;
+    use fs::sort::SortKey;
 
     // The console captures all input while open.
     if app.console.is_some() {

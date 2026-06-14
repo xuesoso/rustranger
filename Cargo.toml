@@ -5,9 +5,17 @@ edition = "2021"
 description = "A minimal standalone Rust file-browser TUI (a ranger-inspired rewrite)"
 license = "GPL-3.0"
 
+[lib]
+name = "rustranger"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rustranger"
 path = "src/main.rs"
+
+[[bench]]
+name = "bench"
+harness = false
 
 [dependencies]
 crossterm = "0.28"

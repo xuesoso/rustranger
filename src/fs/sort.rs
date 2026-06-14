@@ -221,4 +221,112 @@ mod tests {
         }
         assert!(SortKey::from_str("bogus").is_none());
     }
+
+    // ---- full sort_entries ordering (regression guards) -------------------
+
+    use crate::fs::fsobject::{Entry, FType};
+
+    fn ent(name: &str, size: u64, ftype: FType) -> Entry {
+        Entry {
+            path: std::path::PathBuf::from(name),
+            name: name.to_string(),
+            accessible: true,
+            is_link: false,
+            link_ok: true,
+            ftype,
+            size,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            ctime: 0,
+            atime: 0,
+            created: 0,
+            executable: false,
+            marked: false,
+        }
+    }
+
+    fn opts(key: SortKey, reverse: bool) -> SortOptions {
+        SortOptions {
+            key,
+            reverse,
+            directories_first: true,
+            case_insensitive: true,
+        }
+    }
+
+    fn names(v: &[Entry]) -> Vec<&str> {
+        v.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    fn sample() -> Vec<Entry> {
+        // Deliberately unsorted, mixed case, mixed type.
+        vec![
+            ent("file10.txt", 10, FType::File),
+            ent("dir2", 0, FType::Dir),
+            ent("File2.txt", 30, FType::File),
+            ent("dir10", 0, FType::Dir),
+            ent("file1.log", 20, FType::File),
+        ]
+    }
+
+    #[test]
+    fn natural_sort_dirs_first_case_insensitive() {
+        let mut v = sample();
+        sort_entries(&mut v, &opts(SortKey::Natural, false));
+        // dirs first (natural: 2 < 10), then files natural+ci (1 < 2 < 10).
+        assert_eq!(
+            names(&v),
+            ["dir2", "dir10", "file1.log", "File2.txt", "file10.txt"]
+        );
+    }
+
+    #[test]
+    fn natural_sort_reverse_keeps_dirs_first() {
+        let mut v = sample();
+        sort_entries(&mut v, &opts(SortKey::Natural, true));
+        // reverse flips within each group, but dirs still precede files.
+        assert_eq!(
+            names(&v),
+            ["dir10", "dir2", "file10.txt", "File2.txt", "file1.log"]
+        );
+    }
+
+    #[test]
+    fn basename_sort_is_lexicographic_ci() {
+        let mut v = sample();
+        sort_entries(&mut v, &opts(SortKey::Basename, false));
+        // ci lexicographic: "dir10" < "dir2" ('1' < '2'); files compare byte-wise
+        // after "file1" => '.' (0x2e) < '0' (0x30) so file1.log < file10.txt < File2.txt.
+        assert_eq!(
+            names(&v),
+            ["dir10", "dir2", "file1.log", "file10.txt", "File2.txt"]
+        );
+    }
+
+    #[test]
+    fn size_sort_ascending_with_name_tiebreak() {
+        let mut v = vec![
+            ent("b.txt", 5, FType::File),
+            ent("a.txt", 5, FType::File),
+            ent("big.txt", 99, FType::File),
+        ];
+        sort_entries(&mut v, &opts(SortKey::Size, false));
+        // equal sizes tie-break by name (a before b), then larger size.
+        assert_eq!(names(&v), ["a.txt", "b.txt", "big.txt"]);
+    }
+
+    #[test]
+    fn extension_sort_groups_by_ext_then_name() {
+        let mut v = vec![
+            ent("z.rs", 0, FType::File),
+            ent("a.txt", 0, FType::File),
+            ent("a.rs", 0, FType::File),
+            ent("noext", 0, FType::File),
+        ];
+        sort_entries(&mut v, &opts(SortKey::Extension, false));
+        // "" (noext) < "rs" < "txt"; within rs, a before z.
+        assert_eq!(names(&v), ["noext", "a.rs", "z.rs", "a.txt"]);
+    }
 }
