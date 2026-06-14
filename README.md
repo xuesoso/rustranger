@@ -156,3 +156,20 @@ The active theme is also switchable at runtime with `:set theme <name>`. Run
 Bookmarks persist under `$XDG_DATA_HOME/rustranger/bookmarks`. Tags (`t`) are
 in-session only and are not written to disk. File opening uses `$VISUAL`/`$EDITOR`
 for text and `xdg-open` (`open` on macOS) otherwise; `:shell` uses `$SHELL`.
+
+## Development
+
+The crate is split into a library (`src/lib.rs`) and a thin binary
+(`src/main.rs`), so tests and benchmarks can drive the internals directly.
+
+```sh
+cargo test                 # unit tests
+cargo clippy --all-targets # lints (kept at zero warnings)
+cargo bench --bench bench  # zero-dependency micro-benchmarks for the hot paths
+```
+
+Rendering uses a cell back-buffer that diffs successive frames and writes only
+the cells that changed (ncurses-style), so a cursor move repaints a couple of
+rows rather than the whole screen — which keeps it smooth over SSH and inside
+tmux. Benchmark baselines and the optimization log live in
+[`PERFORMANCE.md`](PERFORMANCE.md).
