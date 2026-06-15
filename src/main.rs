@@ -38,6 +38,7 @@ usage: rustranger [PATH] [options]
   --time-format FMT         date (YYYY/MM/DD) | datetime (YYYY/MM/DD/HH/MM)
   --size-format FMT         human|binary|bytes
   --set KEY=VALUE           override any config.toml setting (repeatable)
+  -v, -V, --version         print version and exit
   -h, --help                show this help
 
 Persistent defaults live in ~/.config/rustranger/config.toml; the flags above
@@ -59,6 +60,10 @@ fn parse_args() -> Args {
             "--choosefile" | "--selectfile" => choosefile = take_val().map(PathBuf::from),
             "-h" | "--help" => {
                 println!("{}", HELP);
+                std::process::exit(0);
+            }
+            "-v" | "-V" | "--version" => {
+                println!("rustranger {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--theme" => {
