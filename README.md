@@ -180,6 +180,10 @@ html = "firefox &"
   it for GUI apps. Without it the program runs in the **foreground**, suspending
   the TUI until it exits — correct for terminal apps, pagers, editors, or another
   `rustranger`.
+- Compound extensions work: a `.csv.gz` first tries an explicit `csv.gz` mapping,
+  then peels the compression suffix (`.gz`, `.bz2`, `.xz`, `.zst`, …) and uses the
+  `csv` opener, then a bare `gz` mapping — so setting `csv`/`tsv` also covers
+  `.csv.gz`/`.tsv.gz`.
 - A matching `[open]` entry takes priority; files with no entry fall back to the
   built-in `$EDITOR` / `xdg-open` behavior.
 

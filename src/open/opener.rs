@@ -46,13 +46,50 @@ pub fn open_file(path: &Path, cwd: PathBuf, openers: &[(String, String)]) -> Run
     }
 }
 
-/// The configured command for `path`'s extension, if any (case-insensitive).
+/// Compression suffixes that are "peeled" during opener lookup, so a `.csv.gz`
+/// can fall back to the `.csv` opener.
+const COMPRESSION_EXTS: &[&str] = &["gz", "bz2", "xz", "zst", "lz4", "lzma", "lz", "z", "br"];
+
+/// The configured command for `path`, if any. Extension candidates are tried
+/// most- to least-specific (see `ext_candidates`), case-insensitively.
 fn user_opener<'a>(path: &Path, openers: &'a [(String, String)]) -> Option<&'a str> {
-    let ext = path.extension()?.to_string_lossy().to_lowercase();
-    openers
-        .iter()
-        .find(|(e, _)| *e == ext)
-        .map(|(_, cmd)| cmd.as_str())
+    for cand in ext_candidates(path) {
+        if let Some((_, cmd)) = openers.iter().find(|(e, _)| *e == cand) {
+            return Some(cmd.as_str());
+        }
+    }
+    None
+}
+
+/// Extension candidates for opener lookup, most-specific first. The dotted
+/// suffixes (longest → shortest) come first so an explicit compound mapping wins;
+/// then, when the file ends in a known compression suffix, the inner extension is
+/// inserted so a `.csv.gz` uses the `.csv` opener. Examples:
+///   "data.csv.gz"  -> ["csv.gz", "csv", "gz"]
+///   "a.b.tsv.zst"  -> ["b.tsv.zst", "tsv.zst", "tsv", "zst"]
+///   "data.csv"     -> ["csv"]
+fn ext_candidates(path: &Path) -> Vec<String> {
+    let name = match path.file_name() {
+        Some(n) => n.to_string_lossy().to_lowercase(),
+        None => return Vec::new(),
+    };
+    // A leading dot (hidden file) is part of the stem, not an extension dot.
+    let parts: Vec<&str> = name.trim_start_matches('.').split('.').collect();
+    if parts.len() < 2 {
+        return Vec::new(); // no extension
+    }
+    let exts = &parts[1..]; // drop the stem, e.g. ["csv", "gz"]
+    let mut cands: Vec<String> = (0..exts.len()).map(|i| exts[i..].join(".")).collect();
+    // Peel a known compression suffix: a content-type opener (e.g. "csv") should
+    // win over the bare compression opener ("gz") but lose to an explicit compound.
+    if exts.len() >= 2 && COMPRESSION_EXTS.contains(&exts[exts.len() - 1]) {
+        let inner = exts[exts.len() - 2].to_string();
+        if !cands.contains(&inner) {
+            let pos = cands.len() - 1; // just before the bare compression candidate
+            cands.insert(pos, inner);
+        }
+    }
+    cands
 }
 
 /// Build a run request from a user command template. Tokens are split on
@@ -223,5 +260,39 @@ mod tests {
         let r = open_file(Path::new("/x/pic.png"), cwd(), &[]);
         assert!(matches!(r.argv[0].as_str(), "xdg-open" | "open"));
         assert!(!r.block);
+    }
+
+    #[test]
+    fn ext_candidates_peels_compression() {
+        assert_eq!(ext_candidates(Path::new("/x/data.csv.gz")), ["csv.gz", "csv", "gz"]);
+        assert_eq!(ext_candidates(Path::new("/x/a.b.tsv.zst")), ["b.tsv.zst", "tsv.zst", "tsv", "zst"]);
+        assert_eq!(ext_candidates(Path::new("/x/data.csv")), ["csv"]);
+        // Not a compression suffix => no peel, just the dotted suffixes.
+        assert_eq!(ext_candidates(Path::new("/x/a.foo.bar")), ["foo.bar", "bar"]);
+        assert!(ext_candidates(Path::new("/x/noext")).is_empty());
+    }
+
+    #[test]
+    fn compressed_file_uses_inner_extension_opener() {
+        let openers = vec![
+            ("csv".to_string(), "rustidata".to_string()),
+            ("tsv".to_string(), "rustidata".to_string()),
+        ];
+        let r = open_file(Path::new("/x/data.csv.gz"), cwd(), &openers);
+        assert_eq!(r.argv[0], "rustidata");
+        assert_eq!(r.argv.last().unwrap(), "/x/data.csv.gz");
+        let r = open_file(Path::new("/x/data.tsv.gz"), cwd(), &openers);
+        assert_eq!(r.argv[0], "rustidata");
+    }
+
+    #[test]
+    fn explicit_compound_wins_over_peeled_inner() {
+        let openers = vec![
+            ("csv".to_string(), "rustidata".to_string()),
+            ("csv.gz".to_string(), "zcat-viewer".to_string()),
+        ];
+        // The full compound "csv.gz" is more specific than the peeled "csv".
+        let r = open_file(Path::new("/x/data.csv.gz"), cwd(), &openers);
+        assert_eq!(r.argv[0], "zcat-viewer");
     }
 }
