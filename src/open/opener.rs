@@ -35,12 +35,14 @@ pub fn open_file(path: &Path, cwd: PathBuf, openers: &[(String, String)]) -> Run
         RunRequest {
             argv,
             block: true,
+            fullscreen: true,
             cwd,
         }
     } else {
         RunRequest {
             argv: vec![generic_opener().to_string(), path.to_string_lossy().into_owned()],
             block: false,
+            fullscreen: false,
             cwd,
         }
     }
@@ -123,7 +125,11 @@ fn build_command(cmd: &str, path: &Path, cwd: PathBuf) -> RunRequest {
     if !substituted {
         argv.push(p);
     }
-    RunRequest { argv, block, cwd }
+    // A foreground (blocking) opener is assumed to be a full-screen terminal app
+    // (editor/pager/TUI viewer) — the common case — so the alternate screen is
+    // kept across the handoff to avoid the default-background flash. Detached (`&`)
+    // GUI apps don't suspend the TUI at all, so the flag is moot for them.
+    RunRequest { argv, block, fullscreen: block, cwd }
 }
 
 /// Open a file (or selection) with an explicitly named program.
@@ -136,7 +142,7 @@ pub fn open_with(program: &str, paths: &[PathBuf], cwd: PathBuf) -> RunRequest {
     // Heuristic: terminal editors/pagers block; assume named programs block unless
     // they look like a GUI opener.
     let block = !matches!(argv.first().map(String::as_str), Some("xdg-open") | Some("open"));
-    RunRequest { argv, block, cwd }
+    RunRequest { argv, block, fullscreen: block, cwd }
 }
 
 /// Run a shell command line (`:shell ...`).
@@ -145,6 +151,9 @@ pub fn shell(cmdline: &str, cwd: PathBuf) -> RunRequest {
     RunRequest {
         argv: vec![shell, "-c".to_string(), cmdline.to_string()],
         block: true,
+        // Inline: leave the alternate screen so command output lands on the normal
+        // screen (a `:shell` line may just print text rather than draw a UI).
+        fullscreen: false,
         cwd,
     }
 }
@@ -156,6 +165,7 @@ pub fn pager(path: &Path, cwd: PathBuf) -> RunRequest {
     RunRequest {
         argv,
         block: true,
+        fullscreen: true,
         cwd,
     }
 }
@@ -237,6 +247,33 @@ mod tests {
         let r = build_command("zathura &", Path::new("/a/b.pdf"), cwd());
         assert_eq!(r.argv, vec!["zathura", "/a/b.pdf"]);
         assert!(!r.block, "trailing & detaches (GUI app), TUI stays up");
+    }
+
+    /// The `fullscreen` flag drives whether the main loop keeps the alternate screen
+    /// across the handoff (no default-background flash). Foreground terminal apps —
+    /// editors, pagers, foreground `[open]` commands — keep it; inline `:shell` does
+    /// not (so its output reaches the normal screen); detached GUI apps never block.
+    #[test]
+    fn fullscreen_flag_tracks_terminal_takeover() {
+        // $EDITOR text open: blocking + full-screen.
+        let ed = open_file(Path::new("/x/notes.txt"), cwd(), &[]);
+        assert!(ed.block && ed.fullscreen, "editor takes over the screen");
+
+        // Foreground [open] command: blocking + full-screen.
+        let fg = build_command("rustidata", Path::new("/x/data.csv"), cwd());
+        assert!(fg.block && fg.fullscreen);
+
+        // Detached [open] (`&`): not blocking, so fullscreen is moot (and false).
+        let gui = build_command("zathura &", Path::new("/x/a.pdf"), cwd());
+        assert!(!gui.block && !gui.fullscreen);
+
+        // Pager: blocking + full-screen.
+        let pg = pager(Path::new("/x/a.log"), cwd());
+        assert!(pg.block && pg.fullscreen);
+
+        // :shell: blocking but NOT full-screen (output goes to the normal screen).
+        let sh = shell("echo hi", cwd());
+        assert!(sh.block && !sh.fullscreen);
     }
 
     #[test]

@@ -207,7 +207,11 @@ fn run(app: &mut App) -> io::Result<()> {
             if needs_full {
                 prev = None;
                 frame.clear();
-                screen::clear(&mut frame, default)?;
+                // Clear to the active theme's background (not the terminal default)
+                // so first paint / resize / resume-from-editor never flashes the
+                // terminal's bare background before the themed frame lands on top.
+                let clear_style = Style::new(app.settings.theme.fg, app.settings.theme.bg);
+                screen::clear(&mut frame, clear_style)?;
                 out.write_all(&frame)?;
                 needs_full = false;
             }
@@ -255,7 +259,8 @@ fn run(app: &mut App) -> io::Result<()> {
         // Run any external program requested this iteration. A blocking program
         // (editor/pager/shell) suspends the TUI, so force a full repaint after.
         if let Some(req) = app.pending_run.take() {
-            if run_external(&mut out, req)? {
+            let bg = app.settings.theme.bg;
+            if run_external(&mut out, req, bg)? {
                 needs_full = true;
             }
         }
@@ -280,7 +285,11 @@ fn handle_event(app: &mut App, ev: Event, pending: &mut Option<char>, count: &mu
 /// Returns `true` when the TUI was suspended (a blocking program ran), so the
 /// caller knows the terminal contents are now unknown and the next frame must be
 /// a full repaint rather than a diff against the pre-launch screen.
-fn run_external(out: &mut io::Stdout, req: open::RunRequest) -> io::Result<bool> {
+fn run_external(
+    out: &mut io::Stdout,
+    req: open::RunRequest,
+    bg: crossterm::style::Color,
+) -> io::Result<bool> {
     use std::process::{Command, Stdio};
     if req.argv.is_empty() {
         return Ok(false);
@@ -289,9 +298,17 @@ fn run_external(out: &mut io::Stdout, req: open::RunRequest) -> io::Result<bool>
     cmd.args(&req.argv[1..]).current_dir(&req.cwd);
 
     if req.block {
-        restore_terminal()?;
+        if req.fullscreen {
+            suspend_keep_screen(bg)?;
+        } else {
+            restore_terminal()?;
+        }
         let status = cmd.status();
-        setup_terminal()?;
+        if req.fullscreen {
+            resume_keep_screen(bg)?;
+        } else {
+            setup_terminal()?;
+        }
         out.flush()?;
         if let Err(e) = status {
             // Swallow; nothing fatal, surface nothing for now.
@@ -306,6 +323,65 @@ fn run_external(out: &mut io::Stdout, req: open::RunRequest) -> io::Result<bool>
         Ok(false)
     }
 }
+
+/// Suspend the TUI for a full-screen child *without leaving the alternate screen*.
+/// A full-screen program (editor/pager/TUI) enters its own alternate screen and
+/// clears it to its own background, so keeping ours active means the terminal never
+/// drops to the primary buffer's default background — eliminating the dark→white→
+/// dark flash and leaving the shell's scrollback untouched.
+///
+/// The subtle part is the window *before* the child's own theme loads. A captured
+/// nvim startup shows it reset SGR (`ESC[0m`) and repaint every row with the
+/// terminal's **default** background — it even queries that default via `OSC 11` —
+/// so setting our SGR background isn't enough on its own. We therefore also override
+/// the terminal's *default* background with `OSC 11` for the duration of the child,
+/// so that transitional paint (and the child's query) comes back dark, not white.
+/// Paired with the `OSC 111` reset in [`resume_keep_screen`]. (No-op for the
+/// `default` theme, whose background is the terminal default already.)
+fn suspend_keep_screen(bg: crossterm::style::Color) -> io::Result<()> {
+    use crossterm::style::SetBackgroundColor;
+    use crossterm::terminal::{Clear, ClearType, EnableLineWrap};
+    let mut out = io::stdout();
+    execute!(out, cursor::Show, EnableLineWrap, SetBackgroundColor(bg), Clear(ClearType::All))?;
+    if let Some(seq) = osc_set_default_bg(bg) {
+        out.write_all(seq.as_bytes())?;
+        out.flush()?;
+    }
+    disable_raw_mode()?;
+    Ok(())
+}
+
+/// Resume after a full-screen child. Undo the `OSC 11` default-background override,
+/// then re-assert our alternate screen — with the theme background set first so the
+/// enter-clear is dark, not the terminal default. A full repaint follows on the next
+/// frame (the caller returns `true`).
+fn resume_keep_screen(bg: crossterm::style::Color) -> io::Result<()> {
+    use crossterm::style::SetBackgroundColor;
+    use crossterm::terminal::DisableLineWrap;
+    let mut out = io::stdout();
+    enable_raw_mode()?;
+    if osc_set_default_bg(bg).is_some() {
+        out.write_all(OSC_RESET_DEFAULT_BG.as_bytes())?;
+    }
+    execute!(out, SetBackgroundColor(bg), EnterAlternateScreen, cursor::Hide, DisableLineWrap)?;
+    Ok(())
+}
+
+/// `OSC 11` sequence setting the terminal's *default* background to a concrete RGB
+/// theme colour (`ESC ] 11 ; rgb:RR/GG/BB BEL`). Returns `None` for `Color::Reset`
+/// (the `default` theme) and non-RGB colours, where there is nothing to override.
+/// Handled natively by tmux 3.3+ for the pane, so it works inside tmux and SSH.
+fn osc_set_default_bg(bg: crossterm::style::Color) -> Option<String> {
+    match bg {
+        crossterm::style::Color::Rgb { r, g, b } => {
+            Some(format!("\x1b]11;rgb:{:02x}/{:02x}/{:02x}\x07", r, g, b))
+        }
+        _ => None,
+    }
+}
+
+/// `OSC 111`: reset the default background to the terminal's own configured value.
+const OSC_RESET_DEFAULT_BG: &str = "\x1b]111\x07";
 
 fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &mut Option<usize>) {
     use fs::sort::SortKey;
@@ -565,4 +641,23 @@ fn handle_help_key(app: &mut App, key: KeyEvent) {
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::style::Color;
+
+    #[test]
+    fn osc_default_bg_only_for_rgb_themes() {
+        // A concrete RGB theme background → OSC 11 with 2-hex-per-channel rgb:.
+        assert_eq!(
+            osc_set_default_bg(Color::Rgb { r: 0x28, g: 0x28, b: 0x28 }),
+            Some("\x1b]11;rgb:28/28/28\x07".to_string()),
+        );
+        // The `default` theme keeps the terminal background → nothing to override.
+        assert_eq!(osc_set_default_bg(Color::Reset), None);
+        // Named/indexed colours aren't overridden either (no reliable RGB).
+        assert_eq!(osc_set_default_bg(Color::Blue), None);
+    }
 }
