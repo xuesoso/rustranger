@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -12,6 +13,18 @@ use rustranger::{config, fs, open, ui};
 /// Internal pending-key sentinel for the `um{key}` chord (awaiting the bookmark
 /// key to delete). Not a typeable key, so it never collides with a real prefix.
 const UNBOOKMARK_PENDING: char = '\u{1}';
+
+/// Set by the SIGTERM/SIGHUP handler. The run loop checks it every tick (the
+/// idle poll is 500 ms), so a plain `kill` or a closed terminal exits through
+/// the normal path — restoring raw mode and the alternate screen — instead of
+/// leaving the shell on a raw, drawn-over screen.
+static TERMINATE: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_terminate(_sig: libc::c_int) {
+    // A relaxed atomic store is async-signal-safe; everything else happens on
+    // the main thread once the loop observes the flag.
+    TERMINATE.store(true, Ordering::Relaxed);
+}
 
 struct Args {
     start: PathBuf,
@@ -130,6 +143,13 @@ fn main() -> io::Result<()> {
     let mut app = App::new(args.start, settings);
     app.choosefile = args.choosefile;
 
+    // Exit cleanly on SIGTERM/SIGHUP (`kill`, terminal window closed).
+    let handler = on_terminate as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGHUP, handler);
+    }
+
     setup_terminal()?;
     // Restore the terminal even if we panic mid-render.
     let prev_hook = std::panic::take_hook();
@@ -193,7 +213,7 @@ fn run(app: &mut App) -> io::Result<()> {
     // resize and after a blocking external program (editor/pager/shell), whose
     // output left the real screen contents unknown to our diff model.
     let mut needs_full = false;
-    while !app.quit {
+    while !app.quit && !TERMINATE.load(Ordering::Relaxed) {
         app.prepare_view();
         if let Ok((cols, rows)) = crossterm::terminal::size() {
             let (cols, rows) = (cols as usize, rows as usize);
@@ -227,15 +247,25 @@ fn run(app: &mut App) -> io::Result<()> {
             }
             out.write_all(&frame)?;
             out.flush()?;
-            prev = Some(cur.clone());
+            // Snapshot the displayed frame as the next diff baseline. Swapping
+            // buffers (instead of cloning) avoids a fresh allocation and a full
+            // grid copy per frame; render() rebuilds `cur` from scratch anyway,
+            // and `prev` is dropped to None whenever the size changes.
+            match prev.as_mut() {
+                Some(p) => std::mem::swap(p, &mut cur),
+                None => prev = Some(cur.clone()),
+            }
         }
 
         // Wait for input: poll briefly when background jobs run (so progress
-        // updates), otherwise block until a key arrives.
+        // updates); otherwise poll on a slow idle tick so changes made to the
+        // visible directories by other programs show up without a keypress
+        // (prepare_view re-checks their mtimes — see App::refresh_from_disk).
+        // An idle no-change tick costs 2-3 stats and a diff that emits nothing.
         let have_event = if app.jobs_active() {
             event::poll(std::time::Duration::from_millis(80))?
         } else {
-            true
+            event::poll(std::time::Duration::from_millis(500))?
         };
         if have_event {
             handle_event(app, event::read()?, &mut pending, &mut count);
@@ -260,8 +290,14 @@ fn run(app: &mut App) -> io::Result<()> {
         // (editor/pager/shell) suspends the TUI, so force a full repaint after.
         if let Some(req) = app.pending_run.take() {
             let bg = app.settings.theme.bg;
-            if run_external(&mut out, req, bg)? {
+            let (suspended, error) = run_external(&mut out, req, bg)?;
+            if suspended {
                 needs_full = true;
+            }
+            // Surface a launch failure (e.g. a mistyped $EDITOR) in the status
+            // bar instead of flashing the screen and saying nothing.
+            if error.is_some() {
+                app.message = error;
             }
         }
     }
@@ -282,17 +318,20 @@ fn handle_event(app: &mut App, ev: Event, pending: &mut Option<char>, count: &mu
 /// Run an external program. Blocking programs (editors/pager/shell) suspend the
 /// TUI; forked GUI programs are detached and the TUI keeps running.
 ///
-/// Returns `true` when the TUI was suspended (a blocking program ran), so the
-/// caller knows the terminal contents are now unknown and the next frame must be
-/// a full repaint rather than a diff against the pre-launch screen.
+/// Returns `(suspended, error)`: `suspended` is true when the TUI was suspended
+/// (a blocking program ran), so the caller knows the terminal contents are now
+/// unknown and the next frame must be a full repaint rather than a diff against
+/// the pre-launch screen. `error` carries a launch failure (e.g. a mistyped
+/// `$EDITOR`) for the status bar; a program that ran and exited nonzero is its
+/// own business and is not reported.
 fn run_external(
     out: &mut io::Stdout,
     req: open::RunRequest,
     bg: crossterm::style::Color,
-) -> io::Result<bool> {
+) -> io::Result<(bool, Option<String>)> {
     use std::process::{Command, Stdio};
     if req.argv.is_empty() {
-        return Ok(false);
+        return Ok((false, None));
     }
     let mut cmd = Command::new(&req.argv[0]);
     cmd.args(&req.argv[1..]).current_dir(&req.cwd);
@@ -310,17 +349,19 @@ fn run_external(
             setup_terminal()?;
         }
         out.flush()?;
-        if let Err(e) = status {
-            // Swallow; nothing fatal, surface nothing for now.
-            let _ = e;
-        }
-        Ok(true)
+        let error = status
+            .err()
+            .map(|e| format!("failed to run {}: {}", req.argv[0], e));
+        Ok((true, error))
     } else {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let _ = cmd.spawn();
-        Ok(false)
+        let error = cmd
+            .spawn()
+            .err()
+            .map(|e| format!("failed to run {}: {}", req.argv[0], e));
+        Ok((false, error))
     }
 }
 
@@ -417,7 +458,11 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
             if c.is_ascii_digit() && !key.modifiers.contains(KeyModifiers::ALT) {
                 let d = c.to_digit(10).unwrap() as usize;
                 if c != '0' || count.is_some() {
-                    *count = Some(count.unwrap_or(0) * 10 + d);
+                    // Saturate and cap: an absurdly long digit prefix must not
+                    // overflow (debug panic / release wraparound to a negative
+                    // isize move) nor stall visual-mode marking.
+                    let next = count.unwrap_or(0).saturating_mul(10).saturating_add(d);
+                    *count = Some(next.min(1_000_000));
                     return;
                 }
             }

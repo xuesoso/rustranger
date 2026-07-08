@@ -24,6 +24,9 @@ pub struct Dir {
     /// mtime of the directory at load time, for outdated detection.
     load_mtime: Option<SystemTime>,
     pub error: Option<String>,
+    /// App-level access stamp (see `App::evict_caches`): least-recently-used
+    /// cached directories are evicted past a cap so memory stays bounded.
+    pub last_access: u64,
 }
 
 impl Dir {
@@ -37,13 +40,22 @@ impl Dir {
             temporary_filter: None,
             load_mtime: None,
             error: None,
+            last_access: 0,
         }
     }
 
     /// (Re)load the directory contents from disk.
     pub fn load(&mut self, settings: &Settings) {
-        // Remember the cursor target by name before rebuilding from disk.
+        // Remember the cursor target and the marked names before rebuilding, so
+        // a reload — including an auto-refresh picking up external changes —
+        // keeps the cursor and an in-progress selection instead of wiping them.
         let pointed = self.current().map(|e| e.name.clone());
+        let marked: HashSet<String> = self
+            .files_all
+            .iter()
+            .filter(|e| e.marked)
+            .map(|e| e.name.clone())
+            .collect();
 
         self.files_all.clear();
         self.error = None;
@@ -56,6 +68,13 @@ impl Dir {
             }
             Err(e) => {
                 self.error = Some(e.to_string());
+            }
+        }
+        if !marked.is_empty() {
+            for e in &mut self.files_all {
+                if marked.contains(e.name.as_str()) {
+                    e.marked = true;
+                }
             }
         }
 
@@ -295,8 +314,9 @@ fn dir_mtime(path: &Path) -> Option<SystemTime> {
 
 /// Case-insensitive substring test (ASCII case folding), allocation-free.
 /// `needle` must already be ASCII-lowercased. Non-ASCII bytes compare exactly,
-/// matching the sort comparator's ASCII-only folding.
-fn ci_contains(haystack: &str, needle: &[u8]) -> bool {
+/// matching the sort comparator's ASCII-only folding. Shared by the `:filter`
+/// pipeline here and `/` search in `App::find_match`.
+pub(crate) fn ci_contains(haystack: &str, needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
     }
@@ -387,6 +407,31 @@ mod tests {
             .map(|n| dir.join(n))
             .collect();
         assert_eq!(d.survivor_name(&all), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A reload must keep marks (matched by name): the auto-refresh can reload
+    /// the listing mid-selection, and must not wipe the user's marks.
+    #[test]
+    fn reload_preserves_marks_by_name() {
+        let dir = std::env::temp_dir().join(format!("rr_dir_marks_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for n in ["a", "b", "c"] {
+            fs::write(dir.join(n), b"x").unwrap();
+        }
+        let settings = Settings::default();
+        let mut d = Dir::new(dir.clone());
+        d.load(&settings);
+        d.move_to(0);
+        d.toggle_mark_at_pointer(); // a
+        d.move_to(2);
+        d.toggle_mark_at_pointer(); // c
+
+        d.load(&settings); // e.g. an auto-refresh reload
+        let marked: Vec<&str> = d.visible().filter(|e| e.marked).map(|e| e.name.as_str()).collect();
+        assert_eq!(marked, ["a", "c"]);
 
         let _ = fs::remove_dir_all(&dir);
     }

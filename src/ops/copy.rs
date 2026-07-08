@@ -7,10 +7,52 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use super::fileops::get_safe_path;
 
 const CHUNK: usize = 64 * 1024;
+
+/// Minimum interval between streamed progress messages. Without it a fast copy
+/// sends (and allocates a label String for) one message per 64 KB chunk —
+/// hundreds of thousands for a big file — which the UI, redrawing at ~12 Hz,
+/// drains and throws away.
+const REPORT_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Rate-limited progress sender for the worker thread.
+struct Reporter<'a> {
+    tx: &'a Sender<Progress>,
+    last: Option<Instant>,
+}
+
+impl<'a> Reporter<'a> {
+    fn new(tx: &'a Sender<Progress>) -> Reporter<'a> {
+        Reporter { tx, last: None }
+    }
+
+    /// Send only if `REPORT_INTERVAL` has passed since the last message.
+    fn maybe(&mut self, done: u64, total: u64, label: &str) {
+        let due = match self.last {
+            Some(t) => t.elapsed() >= REPORT_INTERVAL,
+            None => true,
+        };
+        if due {
+            self.force(done, total, label);
+        }
+    }
+
+    /// Send unconditionally (source boundaries, so labels appear promptly).
+    fn force(&mut self, done: u64, total: u64, label: &str) {
+        self.last = Some(Instant::now());
+        let _ = self.tx.send(Progress {
+            done,
+            total,
+            label: label.to_string(),
+            finished: false,
+            error: None,
+        });
+    }
+}
 
 #[derive(Clone)]
 pub struct Progress {
@@ -75,6 +117,7 @@ fn run(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, tx: &Sender<Progress>) {
     let total: u64 = sources.iter().map(|s| tree_size(s)).sum();
     let mut done: u64 = 0;
     let mut error: Option<String> = None;
+    let mut rep = Reporter::new(tx);
 
     for src in &sources {
         let name = match src.file_name() {
@@ -84,18 +127,12 @@ fn run(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, tx: &Sender<Progress>) {
         let target = get_safe_path(&dest.join(name));
 
         let label = name.to_string_lossy().into_owned();
-        let _ = tx.send(Progress {
-            done,
-            total,
-            label: label.clone(),
-            finished: false,
-            error: None,
-        });
+        rep.force(done, total, &label);
 
         let result = if cut {
-            move_path(src, &target, &mut done, total, &label, tx)
+            move_path(src, &target, &mut done, total, &label, &mut rep)
         } else {
-            copy_path(src, &target, &mut done, total, &label, tx)
+            copy_path(src, &target, &mut done, total, &label, &mut rep)
         };
         if let Err(e) = result {
             error = Some(format!("{}: {}", label, e));
@@ -118,22 +155,16 @@ fn move_path(
     done: &mut u64,
     total: u64,
     label: &str,
-    tx: &Sender<Progress>,
+    rep: &mut Reporter,
 ) -> io::Result<()> {
     // Fast path: same-filesystem rename.
     if fs::rename(src, target).is_ok() {
         *done += tree_size(if src.exists() { src } else { target });
-        let _ = tx.send(Progress {
-            done: *done,
-            total,
-            label: label.to_string(),
-            finished: false,
-            error: None,
-        });
+        rep.force(*done, total, label);
         return Ok(());
     }
     // Cross-device: copy then delete the source.
-    copy_path(src, target, done, total, label, tx)?;
+    copy_path(src, target, done, total, label, rep)?;
     super::fileops::delete_path(src)
 }
 
@@ -143,7 +174,7 @@ fn copy_path(
     done: &mut u64,
     total: u64,
     label: &str,
-    tx: &Sender<Progress>,
+    rep: &mut Reporter,
 ) -> io::Result<()> {
     let meta = fs::symlink_metadata(src)?;
     let ft = meta.file_type();
@@ -157,12 +188,12 @@ fn copy_path(
         for entry in fs::read_dir(src)? {
             let entry = entry?;
             let child_target = target.join(entry.file_name());
-            copy_path(&entry.path(), &child_target, done, total, label, tx)?;
+            copy_path(&entry.path(), &child_target, done, total, label, rep)?;
         }
         copy_permissions(src, target);
         Ok(())
     } else if ft.is_file() {
-        copy_file(src, target, done, total, label, tx)?;
+        copy_file(src, target, done, total, label, rep)?;
         copy_permissions(src, target);
         Ok(())
     } else {
@@ -177,7 +208,7 @@ fn copy_file(
     done: &mut u64,
     total: u64,
     label: &str,
-    tx: &Sender<Progress>,
+    rep: &mut Reporter,
 ) -> io::Result<()> {
     let mut reader = fs::File::open(src)?;
     let mut writer = fs::File::create(target)?;
@@ -189,13 +220,7 @@ fn copy_file(
         }
         writer.write_all(&buf[..n])?;
         *done += n as u64;
-        let _ = tx.send(Progress {
-            done: *done,
-            total,
-            label: label.to_string(),
-            finished: false,
-            error: None,
-        });
+        rep.maybe(*done, total, label);
     }
     Ok(())
 }
@@ -220,5 +245,52 @@ fn tree_size(path: &Path) -> u64 {
             .unwrap_or(0)
     } else {
         meta.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Poll the job to completion (bounded, so a hung worker fails the test).
+    fn wait(job: &mut CopyJob) {
+        for _ in 0..1000 {
+            if !job.poll() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("copy job did not finish");
+    }
+
+    #[test]
+    fn copies_a_tree_and_reports_completion() {
+        let base = std::env::temp_dir().join(format!("rr_copy_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("src/sub")).unwrap();
+        fs::write(base.join("src/a.txt"), b"hello").unwrap();
+        fs::write(base.join("src/sub/b.txt"), b"world").unwrap();
+        fs::create_dir_all(base.join("dst")).unwrap();
+
+        let mut job = start(vec![base.join("src")], base.join("dst"), false);
+        wait(&mut job);
+        assert!(job.progress().error.is_none());
+        assert_eq!(fs::read(base.join("dst/src/a.txt")).unwrap(), b"hello");
+        assert_eq!(fs::read(base.join("dst/src/sub/b.txt")).unwrap(), b"world");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn missing_source_reports_an_error() {
+        let base = std::env::temp_dir().join(format!("rr_copy_err_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("dst")).unwrap();
+
+        let mut job = start(vec![base.join("does-not-exist")], base.join("dst"), false);
+        wait(&mut job);
+        assert!(job.progress().error.is_some(), "a failed copy must carry its error");
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

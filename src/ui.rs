@@ -369,7 +369,7 @@ fn draw_preview_column(buf: &mut Buffer, app: &App, x: usize, top: usize, width:
     } else if matches!(entry.ftype, FType::File) {
         draw_file_preview(buf, app, x, top, width, height, t);
     } else {
-        let info = format!("{:?}", entry.ftype);
+        let info = format!("({})", entry.ftype.name());
         buf.set_str(x, top, &util::truncate(&info, width), Style::new(t.info, t.bg));
     }
 }

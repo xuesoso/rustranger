@@ -34,7 +34,8 @@ Directory browsing with the miller-columns layout (parent | current | preview),
 native text-file preview, sorting, filtering, search, marking/visual selection,
 copy/cut/paste (background, with progress + collision-safe naming),
 delete/rename/mkdir/touch/chmod, symlink/hardlink paste, tabs, persistent
-bookmarks, in-session tags, navigation history, a configurable size/date column,
+bookmarks, in-session tags, navigation history, automatic refresh when the
+visible directories change on disk (~0.5 s poll), a configurable size/date column,
 light & dark color themes, a `:` command console, key-chain hint menus, a
 scrollable `?` help, and opening files in external programs.
 

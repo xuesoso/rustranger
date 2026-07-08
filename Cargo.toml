@@ -1,6 +1,6 @@
 [package]
 name = "rustranger"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "A minimal standalone Rust file-browser TUI (a ranger-inspired rewrite)"
 license = "GPL-3.0"

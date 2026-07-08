@@ -18,6 +18,24 @@ pub enum FType {
     Unknown,
 }
 
+impl FType {
+    /// Lowercase human-readable name for status messages and the preview
+    /// placeholder. `Symlink` only survives as the *effective* type when the
+    /// link target is unresolvable, hence "broken symlink".
+    pub fn name(self) -> &'static str {
+        match self {
+            FType::Dir => "directory",
+            FType::File => "regular file",
+            FType::Symlink => "broken symlink",
+            FType::Fifo => "fifo",
+            FType::Socket => "socket",
+            FType::BlockDevice => "block device",
+            FType::CharDevice => "character device",
+            FType::Unknown => "unknown file type",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Entry {
     pub path: PathBuf,
@@ -34,6 +52,11 @@ pub struct Entry {
     pub uid: u32,
     pub gid: u32,
     pub mtime: i64,
+    /// Full-resolution mtime in nanoseconds since the epoch, for freshness
+    /// checks (preview cache invalidation). `mtime` (whole seconds) is kept for
+    /// sorting and the date column; a file modified twice within one second
+    /// only differs here.
+    pub mtime_ns: i64,
     pub ctime: i64,
     pub atime: i64,
     /// Creation time (birthtime where the platform/FS supports it; falls back to
@@ -82,6 +105,10 @@ impl Entry {
                     uid: meta.uid(),
                     gid: meta.gid(),
                     mtime: meta.mtime(),
+                    mtime_ns: meta
+                        .mtime()
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(meta.mtime_nsec()),
                     ctime: meta.ctime(),
                     atime: meta.atime(),
                     created,
@@ -101,6 +128,7 @@ impl Entry {
                 uid: 0,
                 gid: 0,
                 mtime: 0,
+                mtime_ns: 0,
                 ctime: 0,
                 atime: 0,
                 created: 0,

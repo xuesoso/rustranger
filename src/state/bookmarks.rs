@@ -62,7 +62,13 @@ impl Bookmarks {
         for (k, p) in &self.map {
             out.push_str(&format!("{}:{}\n", k, p.display()));
         }
-        let _ = fs::write(&self.file, out);
+        // Write to a sibling temp file, then rename over the target: the rename
+        // is atomic on POSIX, so a crash mid-save can truncate at worst the
+        // temp file — never the existing bookmarks.
+        let tmp = self.file.with_extension("tmp");
+        if fs::write(&tmp, out).is_ok() {
+            let _ = fs::rename(&tmp, &self.file);
+        }
     }
 
     /// Update bookmarks after a directory is renamed/moved.
@@ -82,4 +88,30 @@ impl Bookmarks {
 
 fn is_valid_key(k: char) -> bool {
     k.is_ascii_alphanumeric() || k == '`' || k == '\''
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Saving must round-trip through the file and leave no temp file behind
+    /// (the atomic write-then-rename path).
+    #[test]
+    fn save_roundtrips_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("rr_bm_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("bookmarks");
+
+        let mut bm = Bookmarks::load(file.clone());
+        bm.set('a', PathBuf::from("/tmp"));
+        bm.set('b', PathBuf::from("/home"));
+        assert!(!dir.join("bookmarks.tmp").exists(), "temp file must not linger");
+
+        let re = Bookmarks::load(file);
+        assert_eq!(re.get('a'), Some(&PathBuf::from("/tmp")));
+        assert_eq!(re.get('b'), Some(&PathBuf::from("/home")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

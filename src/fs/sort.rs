@@ -135,34 +135,49 @@ fn ci_cmp(a: &str, b: &str, ci: bool) -> Ordering {
     }
 }
 
-/// Natural ("version") comparison: digit runs compared numerically. Non-digit
-/// runs fold ASCII case when `ci` is set, matching the basename comparator.
+/// Natural ("version") comparison: digit runs compared numerically (leading
+/// zeros ignored, arbitrary length), other bytes with ASCII case folding when
+/// `ci` is set — matching the basename comparator.
+///
+/// Operates on bytes, not decoded chars: UTF-8 is an order-preserving encoding,
+/// so byte order equals codepoint order for the non-ASCII bytes we never fold.
+/// Skipping the char-decode/peekable machinery cut the *default* sort's cost to
+/// nearly that of the plain basename comparator (see PERFORMANCE.md #5) — the
+/// comparator is no longer the sort's bottleneck.
 fn natural_cmp(a: &str, b: &str, ci: bool) -> Ordering {
-    let mut ai = a.chars().peekable();
-    let mut bi = b.chars().peekable();
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0usize, 0usize);
     loop {
-        match (ai.peek().copied(), bi.peek().copied()) {
+        match (a.get(i), b.get(j)) {
             (None, None) => return Ordering::Equal,
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
-            (Some(ca), Some(cb)) => {
+            (Some(&ca), Some(&cb)) => {
                 if ca.is_ascii_digit() && cb.is_ascii_digit() {
-                    let na = take_number(&mut ai);
-                    let nb = take_number(&mut bi);
-                    match na.cmp(&nb) {
-                        Ordering::Equal => continue,
-                        other => return other,
+                    // Compare the digit runs as numbers without parsing them:
+                    // after skipping leading zeros, more significant digits =
+                    // larger; equal lengths fall to the first differing digit.
+                    let (sa, ea) = digit_run(a, i);
+                    let (sb, eb) = digit_run(b, j);
+                    let ord = (ea - sa)
+                        .cmp(&(eb - sb))
+                        .then_with(|| a[sa..ea].cmp(&b[sb..eb]));
+                    if ord != Ordering::Equal {
+                        return ord;
                     }
+                    i = ea;
+                    j = eb;
                 } else {
-                    ai.next();
-                    bi.next();
-                    let (xa, xb) = if ci {
+                    let (fa, fb) = if ci {
                         (ca.to_ascii_lowercase(), cb.to_ascii_lowercase())
                     } else {
                         (ca, cb)
                     };
-                    match xa.cmp(&xb) {
-                        Ordering::Equal => continue,
+                    match fa.cmp(&fb) {
+                        Ordering::Equal => {
+                            i += 1;
+                            j += 1;
+                        }
                         other => return other,
                     }
                 }
@@ -171,17 +186,19 @@ fn natural_cmp(a: &str, b: &str, ci: bool) -> Ordering {
     }
 }
 
-fn take_number(it: &mut std::iter::Peekable<std::str::Chars>) -> u128 {
-    let mut n: u128 = 0;
-    while let Some(c) = it.peek().copied() {
-        if c.is_ascii_digit() {
-            n = n.saturating_mul(10).saturating_add((c as u8 - b'0') as u128);
-            it.next();
-        } else {
-            break;
-        }
+/// Bounds of the significant digits in the run starting at `start`:
+/// (first non-zero digit, one past the run). An all-zero run yields an empty
+/// significant slice, so "000" and "0" compare equal, like the numbers they are.
+fn digit_run(s: &[u8], start: usize) -> (usize, usize) {
+    let mut i = start;
+    while i < s.len() && s[i] == b'0' {
+        i += 1;
     }
-    n
+    let sig = i;
+    while i < s.len() && s[i].is_ascii_digit() {
+        i += 1;
+    }
+    (sig, i)
 }
 
 fn fnv1a(s: &str) -> u64 {
@@ -204,6 +221,16 @@ mod tests {
         assert_eq!(natural_cmp("file10", "file2", true), Ordering::Greater);
         assert_eq!(natural_cmp("a", "a", true), Ordering::Equal);
         assert_eq!(natural_cmp("img1", "img1a", true), Ordering::Less);
+        // Leading zeros compare as the numbers they are.
+        assert_eq!(natural_cmp("file02", "file2", true), Ordering::Equal);
+        assert_eq!(natural_cmp("a000", "a0", true), Ordering::Equal);
+        assert_eq!(natural_cmp("file010", "file9", true), Ordering::Greater);
+        // Numbers longer than any machine integer still order correctly.
+        let big_hi = format!("x{}1", "9".repeat(45));
+        let big_lo = format!("x{}0", "9".repeat(45));
+        assert_eq!(natural_cmp(&big_hi, &big_lo, true), Ordering::Greater);
+        // Non-ASCII names compare by codepoint (byte order == codepoint order).
+        assert_eq!(natural_cmp("café2", "café10", true), Ordering::Less);
     }
 
     #[test]
@@ -239,6 +266,7 @@ mod tests {
             uid: 0,
             gid: 0,
             mtime: 0,
+            mtime_ns: 0,
             ctime: 0,
             atime: 0,
             created: 0,

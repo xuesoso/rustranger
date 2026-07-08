@@ -3,11 +3,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::config::Settings;
 use crate::console::ConsoleState;
 use crate::fs::sort::SortKey;
-use crate::fs::Dir;
+use crate::fs::{Dir, FType};
 use crate::open::opener;
 use crate::open::RunRequest;
 use crate::ops::copy::{self, CopyJob};
@@ -17,6 +18,28 @@ use crate::state::bookmarks::Bookmarks;
 use crate::state::tags::Tags;
 use crate::state::data_dir;
 use crate::tab::Tab;
+
+/// Minimum interval between on-disk freshness checks of the visible directories.
+/// `prepare_view` runs once per frame; without a throttle, an external process
+/// writing into a large directory would force a full reload on every frame.
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Cache caps: past these sizes the least-recently-used cached directories and
+/// previews are evicted, so a long browsing session cannot grow memory without
+/// bound. Everything on screen (each tab's cwd and parent, the previewed
+/// entry) is protected from eviction.
+const DIR_CACHE_MAX: usize = 32;
+const PREVIEW_CACHE_MAX: usize = 128;
+
+/// A cached file preview: the (mtime_ns, size) stamp the file had when read —
+/// nanosecond resolution so a modification within the same second still
+/// invalidates, with size as a backstop for coarse-timestamp filesystems —
+/// plus an access stamp for LRU eviction.
+pub struct PreviewSlot {
+    stamp: (i64, u64),
+    at: u64,
+    pub preview: Preview,
+}
 
 /// A pending action awaiting y/n confirmation in the status bar.
 pub enum Confirm {
@@ -120,8 +143,8 @@ pub struct App {
     pub current_tab: usize,
     pub quit: bool,
     pub message: Option<String>,
-    /// Cached file previews keyed by path, with the file mtime they were read at.
-    pub previews: HashMap<PathBuf, (i64, Preview)>,
+    /// Cached file previews keyed by path (see [`PreviewSlot`]).
+    pub previews: HashMap<PathBuf, PreviewSlot>,
     /// Vertical scroll offset of the preview pane.
     pub preview_scroll: usize,
     /// Path the preview pane is currently showing (to reset scroll on change).
@@ -149,6 +172,11 @@ pub struct App {
     pub pending_run: Option<RunRequest>,
     /// File-picker mode: when set, choosing a file writes its path here and quits.
     pub choosefile: Option<PathBuf>,
+    /// When the visible directories were last checked against the disk
+    /// (throttles the auto-refresh in `prepare_view`). None = never checked.
+    last_fs_check: Option<Instant>,
+    /// Monotonic counter stamped onto cache entries on access (LRU eviction).
+    access_clock: u64,
 }
 
 impl App {
@@ -177,6 +205,8 @@ impl App {
             search_term: String::new(),
             pending_run: None,
             choosefile: None,
+            last_fs_check: None,
+            access_clock: 0,
         };
         app.ensure_dir(&start);
         app
@@ -187,12 +217,63 @@ impl App {
         self.tabs[self.current_tab].cwd.clone()
     }
 
-    /// Load a directory into the cache if not already present.
+    /// Load a directory into the cache if not already present, and stamp it as
+    /// recently used (the stamp drives the LRU eviction in `evict_caches`).
     pub fn ensure_dir(&mut self, path: &Path) {
         if !self.dirs.contains_key(path) {
             let mut dir = Dir::new(path.to_path_buf());
             dir.load(&self.settings);
             self.dirs.insert(path.to_path_buf(), dir);
+        }
+        self.access_clock += 1;
+        let clock = self.access_clock;
+        if let Some(d) = self.dirs.get_mut(path) {
+            d.last_access = clock;
+        }
+    }
+
+    /// Bound both caches: evict least-recently-used entries past the caps,
+    /// never touching what is on screen (each tab's cwd and its parent, plus
+    /// the pointed entry, whose directory fills the preview column).
+    fn evict_caches(&mut self) {
+        if self.dirs.len() > DIR_CACHE_MAX {
+            let mut keep: HashSet<PathBuf> = HashSet::new();
+            for tab in &self.tabs {
+                keep.insert(tab.cwd.clone());
+                if let Some(p) = tab.cwd.parent() {
+                    keep.insert(p.to_path_buf());
+                }
+            }
+            if let Some(sel) = self.selected_path() {
+                keep.insert(sel);
+            }
+            while self.dirs.len() > DIR_CACHE_MAX {
+                let victim = self
+                    .dirs
+                    .iter()
+                    .filter(|(p, _)| !keep.contains(p.as_path()))
+                    .min_by_key(|(_, d)| d.last_access)
+                    .map(|(p, _)| p.clone());
+                match victim {
+                    Some(p) => {
+                        self.dirs.remove(&p);
+                    }
+                    None => break,
+                }
+            }
+        }
+        while self.previews.len() > PREVIEW_CACHE_MAX {
+            let victim = self
+                .previews
+                .iter()
+                .min_by_key(|(_, s)| s.at)
+                .map(|(p, _)| p.clone());
+            match victim {
+                Some(p) => {
+                    self.previews.remove(&p);
+                }
+                None => break,
+            }
         }
     }
 
@@ -224,6 +305,24 @@ impl App {
     /// Ensure the directories needed to render the miller view (parent + a
     /// directory preview) are loaded into the cache. Called once per frame.
     pub fn prepare_view(&mut self) {
+        // Auto-refresh: pick up changes made to the visible directories by
+        // other programs (files created/deleted/renamed bump the dir mtime).
+        // Throttled so bursts of frames — fast scrolling, job-progress ticks —
+        // don't re-stat and potentially reload on every frame.
+        let due = match self.last_fs_check {
+            Some(t) => t.elapsed() >= AUTO_REFRESH_INTERVAL,
+            None => true,
+        };
+        if due {
+            self.last_fs_check = Some(Instant::now());
+            self.refresh_from_disk();
+        }
+
+        // Keep the cwd loaded (self-healing if anything dropped it) and stamp
+        // it as recently used so eviction can never take the active column.
+        let cwd = self.cwd();
+        self.ensure_dir(&cwd);
+
         if let Some(parent) = self.parent_path() {
             self.ensure_dir(&parent);
             // Keep the parent column's cursor on the directory we're inside.
@@ -237,7 +336,7 @@ impl App {
         let selected = self
             .current_dir()
             .current()
-            .map(|e| (e.path.clone(), e.is_dir(), e.accessible, e.ftype, e.size, e.mtime));
+            .map(|e| (e.path.clone(), e.is_dir(), e.accessible, e.ftype));
 
         // Reset preview scroll when the pointed entry changes.
         let sel_path = selected.as_ref().map(|s| s.0.clone());
@@ -247,7 +346,7 @@ impl App {
         }
 
         match selected {
-            Some((path, true, true, _, _, _)) => {
+            Some((path, true, true, _)) => {
                 self.ensure_dir(&path);
                 // The previewed directory may have changed on disk since it was
                 // cached (e.g. deleted and recreated, or modified externally);
@@ -257,31 +356,73 @@ impl App {
                     dir.reload_if_outdated(&settings);
                 }
             }
-            Some((path, false, _, ftype, size, mtime)) if self.settings.preview_files => {
-                use crate::fs::FType;
+            Some((path, false, _, ftype)) => {
                 if matches!(ftype, FType::File) {
-                    self.ensure_preview(&path, size, mtime);
+                    // A content edit doesn't bump the parent dir's mtime, so the
+                    // cached entry (and the preview keyed off its mtime) would
+                    // stay stale forever: re-stat the pointed file each frame.
+                    let (size, mtime) = self.refresh_selected_file(&path);
+                    if self.settings.preview_files {
+                        self.ensure_preview(&path, size, mtime);
+                    }
                 }
             }
             _ => {}
         }
+
+        self.evict_caches();
+    }
+
+    /// Reload the current directory and its parent when they changed on disk —
+    /// files created, deleted, or renamed by something other than rustranger
+    /// (another shell, a build, a finished download). Cheap when nothing
+    /// changed: one metadata stat per directory. Together with the previewed
+    /// directory's per-frame check in `prepare_view` and the re-check in `cd`,
+    /// every visible column tracks the disk.
+    pub fn refresh_from_disk(&mut self) {
+        let settings = self.settings.clone();
+        let cwd = self.cwd();
+        if let Some(dir) = self.dirs.get_mut(&cwd) {
+            dir.reload_if_outdated(&settings);
+        }
+        if let Some(parent) = self.parent_path() {
+            if let Some(dir) = self.dirs.get_mut(&parent) {
+                dir.reload_if_outdated(&settings);
+            }
+        }
+    }
+
+    /// Re-stat the pointed regular file, refreshing its cached entry in place
+    /// (marks preserved). Returns the fresh (size, mtime_ns) for the preview cache.
+    fn refresh_selected_file(&mut self, path: &Path) -> (u64, i64) {
+        let fresh = crate::fs::Entry::load(path.to_path_buf());
+        let stat = (fresh.size, fresh.mtime_ns);
+        if let Some(e) = self.current_dir_mut().current_mut() {
+            if e.path == *path {
+                let marked = e.marked;
+                *e = fresh;
+                e.marked = marked;
+            }
+        }
+        stat
     }
 
     /// Load (or refresh, if the file changed) the preview for a file path.
-    fn ensure_preview(&mut self, path: &Path, size: u64, mtime: i64) {
-        let needs_load = match self.previews.get(path) {
-            Some((cached_mtime, _)) => *cached_mtime != mtime,
-            None => true,
-        };
-        if needs_load {
-            let prev = preview::load(path, size);
-            self.previews.insert(path.to_path_buf(), (mtime, prev));
+    fn ensure_preview(&mut self, path: &Path, size: u64, mtime_ns: i64) {
+        self.access_clock += 1;
+        let (at, stamp) = (self.access_clock, (mtime_ns, size));
+        match self.previews.get_mut(path) {
+            Some(slot) if slot.stamp == stamp => slot.at = at,
+            _ => {
+                let preview = preview::load(path, size);
+                self.previews.insert(path.to_path_buf(), PreviewSlot { stamp, at, preview });
+            }
         }
     }
 
     pub fn current_preview(&self) -> Option<&Preview> {
         let path = self.preview_path.as_ref()?;
-        self.previews.get(path).map(|(_, p)| p)
+        self.previews.get(path).map(|s| &s.preview)
     }
 
     pub fn scroll_preview(&mut self, delta: isize) {
@@ -333,19 +474,31 @@ impl App {
         let entry = self
             .current_dir()
             .current()
-            .map(|e| (e.path.clone(), e.is_dir(), e.accessible));
+            .map(|e| (e.path.clone(), e.is_dir(), e.accessible, e.ftype));
         match entry {
-            Some((path, true, true)) => self.cd(path),
-            Some((path, false, _)) => self.open_path(&path),
+            Some((path, true, true, _)) => self.cd(path),
+            Some((path, false, _, ftype)) => self.open_path(&path, ftype),
             _ => {}
         }
     }
 
-    fn open_path(&mut self, path: &Path) {
+    fn open_path(&mut self, path: &Path, ftype: FType) {
         // In file-picker mode, write the chosen path and exit instead of opening.
         if let Some(out) = self.choosefile.clone() {
             let _ = std::fs::write(&out, format!("{}\n", path.display()));
             self.quit = true;
+            return;
+        }
+        // Only regular files are opened. A FIFO would block the opener's content
+        // sniff (a plain `open()` on a pipe waits for a writer) — freezing the
+        // whole TUI with no way to interrupt it from inside raw mode — and
+        // sockets/devices are not meaningful to hand to an editor or xdg-open.
+        if !matches!(ftype, FType::File) {
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.message = Some(format!("cannot open {}: {}", name, ftype.name()));
             return;
         }
         self.pending_run = Some(opener::open_file(path, self.cwd(), &self.settings.openers));
@@ -582,13 +735,13 @@ impl App {
             return false;
         }
         let mut finished_dests: Vec<PathBuf> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
         self.jobs.retain_mut(|job| {
             let running = job.poll();
             if !running {
                 finished_dests.push(job.dest.clone());
                 if let Some(err) = &job.progress().error {
-                    finished_dests.push(job.dest.clone());
-                    let _ = err;
+                    errors.push(err.clone());
                 }
             }
             running
@@ -600,7 +753,12 @@ impl App {
             for d in finished_dests {
                 self.reload_dir(&d);
             }
-            self.message = Some("operation complete".to_string());
+            // A failed copy/move must say so — not "complete".
+            self.message = Some(if errors.is_empty() {
+                "operation complete".to_string()
+            } else {
+                format!("operation failed: {}", errors.join("; "))
+            });
         }
         !self.jobs.is_empty()
     }
@@ -783,7 +941,9 @@ impl App {
         if n == 0 {
             return None;
         }
-        let term = term.to_lowercase();
+        // ASCII-folded, allocation-free matching — the same semantics as
+        // `:filter` (one lowercased needle; entries matched without copies).
+        let needle: Vec<u8> = term.bytes().map(|b| b.to_ascii_lowercase()).collect();
         let start = dir.pointer;
         for off in 1..=n {
             let i = if forward {
@@ -791,7 +951,7 @@ impl App {
             } else {
                 (start + n - off) % n
             };
-            if dir.entry_at(i).unwrap().name.to_lowercase().contains(&term) {
+            if crate::fs::directory::ci_contains(&dir.entry_at(i).unwrap().name, &needle) {
                 return Some(i);
             }
         }
@@ -1031,6 +1191,144 @@ mod tests {
 
         // The preview now reflects the empty recreated directory, not the old one.
         assert_eq!(app.get_cached(&base.join("test")).map(|d| d.len()), Some(0));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The auto-refresh bug: files created/deleted behind rustranger's back
+    /// must show up without leaving and re-entering the directory.
+    #[test]
+    fn external_create_and_delete_refresh_the_view() {
+        let base = std::env::temp_dir().join(format!("rr_app_refresh_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a"), b"x").unwrap();
+
+        let mut app = App::new(base.clone(), Settings::default());
+        assert_eq!(app.current_dir().len(), 1);
+
+        // Another program creates a file: it must appear on refresh.
+        // (Sleeps keep the dir mtime distinct on coarse-timestamp filesystems.)
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(base.join("b"), b"x").unwrap();
+        app.refresh_from_disk();
+        assert_eq!(app.current_dir().len(), 2);
+
+        // ...and deletes one: it must disappear.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::remove_file(base.join("a")).unwrap();
+        app.refresh_from_disk();
+        assert_eq!(app.current_dir().len(), 1);
+        assert_eq!(app.current_dir().current().map(|e| e.name.as_str()), Some("b"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Modifying the pointed file's content doesn't bump the directory mtime,
+    /// so it is caught by the per-frame re-stat: the row's size and the preview
+    /// must both reflect the new content.
+    #[test]
+    fn modified_selected_file_refreshes_entry_and_preview() {
+        use crate::preview::Preview;
+        let base = std::env::temp_dir().join(format!("rr_app_mod_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("note.txt"), b"old words").unwrap();
+
+        let mut app = App::new(base.clone(), Settings::default());
+        app.current_dir_mut().select_name("note.txt");
+        app.prepare_view();
+        match app.current_preview() {
+            Some(Preview::Text(lines)) => assert!(lines[0].contains("old")),
+            _ => panic!("expected a text preview"),
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(30)); // mtime granularity
+        let new_body = b"fresh replacement text";
+        std::fs::write(base.join("note.txt"), new_body).unwrap();
+        app.prepare_view();
+        assert_eq!(
+            app.current_dir().current().map(|e| e.size),
+            Some(new_body.len() as u64),
+            "row size must reflect the modified file"
+        );
+        match app.current_preview() {
+            Some(Preview::Text(lines)) => assert!(lines[0].contains("fresh")),
+            _ => panic!("expected the refreshed text preview"),
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Entering a FIFO must not launch an opener: the opener's content sniff
+    /// would block on `open()` until a writer appears, freezing the TUI with no
+    /// way to interrupt it from inside raw mode.
+    #[test]
+    fn enter_on_a_fifo_does_not_open() {
+        let base = std::env::temp_dir().join(format!("rr_app_fifo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let fifo = base.join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        let mut app = App::new(base.clone(), Settings::default());
+        app.current_dir_mut().select_name("pipe");
+        app.enter();
+        assert!(app.pending_run.is_none(), "no opener may be launched for a fifo");
+        assert!(app.message.as_deref().unwrap_or("").contains("fifo"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A failed copy must say so in the status message, not "complete".
+    #[test]
+    fn failed_copy_job_reports_the_error() {
+        let base = std::env::temp_dir().join(format!("rr_app_joberr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut app = App::new(base.clone(), Settings::default());
+        app.jobs.push(copy::start(vec![base.join("does-not-exist")], base.clone(), false));
+        for _ in 0..1000 {
+            app.tick_jobs();
+            if app.jobs.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(app.jobs.is_empty(), "job must finish");
+        let msg = app.message.clone().unwrap_or_default();
+        assert!(msg.contains("failed"), "got message: {:?}", msg);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Long sessions must not grow the caches without bound; the cwd (and other
+    /// on-screen directories) must never be evicted.
+    #[test]
+    fn caches_are_evicted_past_their_caps() {
+        let base = std::env::temp_dir().join(format!("rr_app_evict_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut app = App::new(base.clone(), Settings::default());
+        for i in 0..(DIR_CACHE_MAX + 20) {
+            let p = base.join(format!("d{}", i));
+            std::fs::create_dir_all(&p).unwrap();
+            app.ensure_dir(&p);
+        }
+        for i in 0..(PREVIEW_CACHE_MAX + 50) {
+            app.previews.insert(
+                base.join(format!("f{}", i)),
+                PreviewSlot { stamp: (0, 0), at: i as u64, preview: Preview::Empty },
+            );
+        }
+
+        app.prepare_view(); // runs evict_caches
+        assert!(app.dirs.len() <= DIR_CACHE_MAX, "dirs: {}", app.dirs.len());
+        assert!(app.previews.len() <= PREVIEW_CACHE_MAX, "previews: {}", app.previews.len());
+        assert!(app.get_cached(&base).is_some(), "the cwd must never be evicted");
 
         let _ = std::fs::remove_dir_all(&base);
     }

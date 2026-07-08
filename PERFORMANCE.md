@@ -104,7 +104,32 @@ paint / resize. `DisableLineWrap` avoids autowrap when the last cell is written.
   The no-clear blank-fill (#2) is superseded by the diff (which inherently never
   rewrites unchanged cells).
 
+### 5. Sort: byte-wise natural_cmp; loop: no per-frame buffer clone; jobs: throttled progress
+Batch of CPU/allocation cleanups alongside the reliability work:
+
+- **`natural_cmp` byte-wise** (was char-decoding with a `Peekable`): digit runs
+  are compared as digit spans (skip leading zeros → longer run wins → first
+  differing digit), never parsed into integers, so arbitrarily long numbers order
+  correctly (the old u128 parse saturated). UTF-8 byte order == codepoint order,
+  so non-ASCII ordering is unchanged. `sort_natural` (the **default** sort):
+  **8.04 → 5.19 ms** median @20k (~35% faster), now within ~8% of the plain
+  basename comparator — the comparator is no longer the sort's bottleneck; the
+  floor is the O(n log n) `Entry` moves themselves (an index-sort/Schwartzian
+  would be the next step, deferred).
+- **Frame loop: buffer swap, not clone.** The diff baseline was kept with
+  `prev = Some(cur.clone())` — a fresh allocation + full grid copy every frame.
+  Now `mem::swap`: zero copies (render() rebuilds `cur` from scratch anyway).
+- **Copy jobs: progress throttled to 50 ms** (was one `Progress` + label String
+  allocation per 64 KB chunk — hundreds of thousands for a large file, all
+  drained and discarded by a UI redrawing at ~12 Hz).
+- **`/` search reuses the filter's `ci_contains`** (was `to_lowercase()` — one
+  String allocation per entry scanned, per search).
+- Guards: extended `natural_orders_numbers` (leading zeros, >u128 numbers,
+  non-ASCII), new copy-job tests.
+
 ### Deferred
-- `sort_natural` 7.9 ms / `sort_extension` 7.9 ms (CPU comparators): a byte-wise
-  `natural_cmp` and a precomputed extension key would help, but sorting is not the
-  user-facing bottleneck (load is syscall-bound; sort runs once per cd/re-sort).
+- `sort_extension` ~7.9 ms: still re-derives `extension()` + name tiebreak per
+  comparison; a precomputed key (index-sort) would help. Not the default sort.
+- Directory loads and preview reads run on the UI thread (13 ms @20k load): a
+  hung network mount stalls input. ranger solves this with async loaders; a
+  worker thread that swaps in completed listings is the equivalent here.
