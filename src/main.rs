@@ -213,6 +213,8 @@ fn run(app: &mut App) -> io::Result<()> {
     // resize and after a blocking external program (editor/pager/shell), whose
     // output left the real screen contents unknown to our diff model.
     let mut needs_full = false;
+    // In-pane image/document preview (kitty/sixel graphics over the preview box).
+    let mut img = rustranger::imgpreview::ImagePreview::new();
     while !app.quit && !TERMINATE.load(Ordering::Relaxed) {
         app.prepare_view();
         if let Ok((cols, rows)) = crossterm::terminal::size() {
@@ -234,6 +236,10 @@ fn run(app: &mut App) -> io::Result<()> {
                 screen::clear(&mut frame, clear_style)?;
                 out.write_all(&frame)?;
                 needs_full = false;
+                // The real screen was wiped (resize / resume from a full-screen
+                // child), which also drops any graphics image; forget it so the
+                // sync below re-emits it fresh at the new geometry.
+                img.forget();
             }
             let cursor = ui::render(&mut cur, app);
             frame.clear();
@@ -247,6 +253,12 @@ fn run(app: &mut App) -> io::Result<()> {
             }
             out.write_all(&frame)?;
             out.flush()?;
+            // Paint (or clear) the in-pane image preview over the just-flushed
+            // cells. A sixel clear needs its pixels painted over, so it asks for a
+            // full repaint next frame.
+            if img.sync(&mut out, app, cols, rows)? {
+                needs_full = true;
+            }
             // Snapshot the displayed frame as the next diff baseline. Swapping
             // buffers (instead of cloning) avoids a fresh allocation and a full
             // grid copy per frame; render() rebuilds `cur` from scratch anyway,
@@ -262,11 +274,15 @@ fn run(app: &mut App) -> io::Result<()> {
         // visible directories by other programs show up without a keypress
         // (prepare_view re-checks their mtimes — see App::refresh_from_disk).
         // An idle no-change tick costs 2-3 stats and a diff that emits nothing.
-        let have_event = if app.jobs_active() {
-            event::poll(std::time::Duration::from_millis(80))?
+        let idle_ms = if app.jobs_active() {
+            80
+        } else if img.wants_tick() {
+            // A preview is waiting out its debounce — wake soon to render it.
+            50
         } else {
-            event::poll(std::time::Duration::from_millis(500))?
+            500
         };
+        let have_event = event::poll(std::time::Duration::from_millis(idle_ms))?;
         if have_event {
             handle_event(app, event::read()?, &mut pending, &mut count);
             // Coalesce a burst: handle every event already queued before the next
@@ -289,6 +305,8 @@ fn run(app: &mut App) -> io::Result<()> {
         // Run any external program requested this iteration. A blocking program
         // (editor/pager/shell) suspends the TUI, so force a full repaint after.
         if let Some(req) = app.pending_run.take() {
+            // Remove any preview image so it doesn't linger over the child program.
+            let _ = img.clear(&mut out);
             let bg = app.settings.theme.bg;
             let (suspended, error) = run_external(&mut out, req, bg)?;
             if suspended {
@@ -301,6 +319,8 @@ fn run(app: &mut App) -> io::Result<()> {
             }
         }
     }
+    // Remove any lingering preview image before leaving the alternate screen.
+    let _ = img.clear(&mut out);
     out.flush()?;
     Ok(())
 }

@@ -25,7 +25,7 @@ const TEXT_NAMES: &[&str] = &[
 /// extension wins; otherwise text files open in `$EDITOR` and everything else
 /// goes to the platform opener (`xdg-open`, or `open` on macOS).
 pub fn open_file(path: &Path, cwd: PathBuf, openers: &[(String, String)]) -> RunRequest {
-    if let Some(cmd) = user_opener(path, openers) {
+    if let Some(cmd) = command_for(path, openers) {
         return build_command(cmd, path, cwd);
     }
     if is_text(path) {
@@ -53,10 +53,11 @@ pub fn open_file(path: &Path, cwd: PathBuf, openers: &[(String, String)]) -> Run
 const COMPRESSION_EXTS: &[&str] = &["gz", "bz2", "xz", "zst", "lz4", "lzma", "lz", "z", "br"];
 
 /// The configured command for `path`, if any. Extension candidates are tried
-/// most- to least-specific (see `ext_candidates`), case-insensitively.
-fn user_opener<'a>(path: &Path, openers: &'a [(String, String)]) -> Option<&'a str> {
+/// most- to least-specific (see `ext_candidates`), case-insensitively. Shared by
+/// the `[open]` and `[preview]` per-extension maps.
+pub fn command_for<'a>(path: &Path, map: &'a [(String, String)]) -> Option<&'a str> {
     for cand in ext_candidates(path) {
-        if let Some((_, cmd)) = openers.iter().find(|(e, _)| *e == cand) {
+        if let Some((_, cmd)) = map.iter().find(|(e, _)| *e == cand) {
             return Some(cmd.as_str());
         }
     }

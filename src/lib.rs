@@ -17,6 +17,7 @@ pub mod config;
 pub mod console;
 pub mod fs;
 pub mod image;
+pub mod imgpreview;
 pub mod open;
 pub mod ops;
 pub mod preview;

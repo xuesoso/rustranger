@@ -98,6 +98,37 @@ pub struct Settings {
     /// (lowercased extension without dot, command template). Looked up when
     /// opening a file before the built-in `$EDITOR`/`xdg-open` fallback.
     pub openers: Vec<(String, String)>,
+    /// Per-extension image/document preview commands from the `[preview]` section:
+    /// pairs of (lowercased extension, command template). A matching file is
+    /// previewed as terminal graphics in the preview pane instead of as text.
+    pub preview_cmds: Vec<(String, String)>,
+    /// Terminal graphics protocol used for image previews.
+    pub preview_protocol: PreviewProtocol,
+}
+
+/// Terminal graphics protocol for image previews.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PreviewProtocol {
+    /// Pick by terminal: kitty on Ghostty/kitty/WezTerm, iTerm2's inline-images
+    /// protocol on iTerm2, sixel elsewhere.
+    Auto,
+    Kitty,
+    Sixel,
+    /// iTerm2 OSC 1337 inline images (iTerm2 does not render kitty graphics,
+    /// and its sixel support doesn't survive tmux's image re-encoding).
+    Iterm,
+}
+
+impl PreviewProtocol {
+    pub fn from_str(s: &str) -> Option<PreviewProtocol> {
+        match s {
+            "auto" => Some(PreviewProtocol::Auto),
+            "kitty" => Some(PreviewProtocol::Kitty),
+            "sixel" => Some(PreviewProtocol::Sixel),
+            "iterm" | "iterm2" => Some(PreviewProtocol::Iterm),
+            _ => None,
+        }
+    }
 }
 
 impl Settings {
@@ -138,6 +169,7 @@ impl Settings {
                     }
                 }
                 "open" => self.set_opener(key, value),
+                "preview" => self.set_preview(key, value),
                 _ => {}
             }
         }
@@ -157,6 +189,21 @@ impl Settings {
             slot.1 = cmd;
         } else {
             self.openers.push((ext, cmd));
+        }
+    }
+
+    /// Register a per-extension preview command (from the `[preview]` section),
+    /// normalized like [`set_opener`](Self::set_opener).
+    pub fn set_preview(&mut self, ext: &str, cmd: &str) {
+        let ext = ext.trim().trim_start_matches('.').to_lowercase();
+        let cmd = cmd.trim().to_string();
+        if ext.is_empty() || cmd.is_empty() {
+            return;
+        }
+        if let Some(slot) = self.preview_cmds.iter_mut().find(|(e, _)| *e == ext) {
+            slot.1 = cmd;
+        } else {
+            self.preview_cmds.push((ext, cmd));
         }
     }
 
@@ -207,6 +254,11 @@ impl Settings {
                     self.theme = t;
                 }
             }
+            "preview_protocol" => {
+                if let Some(p) = PreviewProtocol::from_str(value) {
+                    self.preview_protocol = p;
+                }
+            }
             "confirm_on_delete" => self.confirm_on_delete = as_bool(value),
             "wrap_scroll" => self.wrap_scroll = as_bool(value),
             _ => {}
@@ -243,6 +295,7 @@ fn toml_entries(text: &str) -> impl Iterator<Item = (&'static str, &str, &str)> 
                 "[settings]" => "settings",
                 "[theme]" => "theme",
                 "[open]" => "open",
+                "[preview]" => "preview",
                 _ => "",
             };
             return None;
@@ -312,6 +365,26 @@ theme = \"default\"              # default|gruvbox-dark|gruvbox-light|solarized-
 # zip = \"unzip -l {}\"
 # pdf = \"zathura &\"
 # html = \"firefox &\"
+
+# In-pane image/document preview: render matching files as terminal graphics in
+# the preview pane (needs a kitty-graphics or sixel terminal, e.g. Ghostty/kitty;
+# inside tmux set `allow-passthrough on`). The command prints graphics escapes to
+# stdout for the given cell box; folio (https://github.com/xuesoso/folio) provides
+# `folio print`. Install it and put it on PATH, or replace the command below.
+# If the renderer isn't found, previews are simply skipped (no error). Placeholders:
+#   %f file  %p protocol  %x col  %y row  %c cols  %r rows
+#   %w cell-width-px  %h cell-height-px  %t (expands to --tmux inside tmux)
+# preview_protocol = \"auto\"   # auto (default) | kitty | sixel | iterm
+#                              # In tmux, auto asks the tmux server which client is
+#                              # attached now: Ghostty/kitty -> kitty, WezTerm ->
+#                              # iterm, else (incl. iTerm2) -> tmux-native sixel.
+#                              # Outside tmux: kitty on Ghostty/kitty/WezTerm,
+#                              # iterm on iTerm2/VSCode, sixel elsewhere.
+[preview]
+pdf  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f\"
+png  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f\"
+jpg  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f\"
+jpeg = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f\"
 ";
 
 /// Outcome of generating the default config file.
@@ -358,6 +431,8 @@ impl Default for Settings {
             wrap_scroll: false,
             hidden_filter_dotfiles: true,
             openers: Vec::new(),
+            preview_cmds: Vec::new(),
+            preview_protocol: PreviewProtocol::Auto,
         }
     }
 }
@@ -400,6 +475,10 @@ mod tests {
         assert!(matches!(s.size_format, SizeFormat::Human));
         // theme = "default" keeps the terminal background.
         assert!(matches!(s.theme.bg, Color::Reset));
+        // The template ships an active [preview] section (folio) for pdf/png/jpg.
+        assert!(s.preview_cmds.iter().any(|(e, c)| e == "pdf" && c.contains("folio print")));
+        assert!(s.preview_cmds.iter().any(|(e, _)| e == "png"));
+        assert!(s.preview_cmds.iter().any(|(e, _)| e == "jpeg"));
     }
 
     #[test]
@@ -416,6 +495,23 @@ mod tests {
         s.apply_toml("[open]\ncsv = \"libreoffice --calc &\"\n");
         assert_eq!(find(&s, "csv"), Some("libreoffice --calc &"));
         assert_eq!(s.openers.iter().filter(|(e, _)| e == "csv").count(), 1);
+    }
+
+    #[test]
+    fn preview_section_and_protocol_parse() {
+        let mut s = Settings::default();
+        s.apply_toml(
+            "[settings]\npreview_protocol = \"kitty\"\n\n[preview]\nPNG = \"r %f\"\npdf = \"r %f\"\n",
+        );
+        // Parsed value overrides the auto default.
+        assert_eq!(s.preview_protocol, PreviewProtocol::Kitty);
+        assert_eq!(Settings::default().preview_protocol, PreviewProtocol::Auto);
+        // Extension normalized to lowercase, no dot.
+        assert_eq!(
+            s.preview_cmds.iter().find(|(e, _)| e == "png").map(|(_, c)| c.as_str()),
+            Some("r %f")
+        );
+        assert!(s.preview_cmds.iter().any(|(e, _)| e == "pdf"));
     }
 
     #[test]

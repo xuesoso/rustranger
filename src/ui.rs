@@ -359,6 +359,25 @@ fn column_layout(cols: usize, ratios: &[u32]) -> Vec<(usize, usize)> {
     out
 }
 
+/// The preview column's cell rectangle `(x, top, width, height)`, matching what
+/// `draw_miller` uses — for placing a graphics image over the preview pane. None
+/// when the screen is too small or the layout has no preview column.
+pub fn preview_rect(cols: usize, rows: usize, ratios: &[u32]) -> Option<(u16, u16, u16, u16)> {
+    if rows < 3 || cols < 4 {
+        return None;
+    }
+    let layout = column_layout(cols, ratios);
+    let n = layout.len();
+    if n < 2 {
+        return None; // no preview column (single-column layout)
+    }
+    let (x, width) = layout[n - 1];
+    if width == 0 {
+        return None;
+    }
+    Some((x as u16, 1, width as u16, (rows - 2) as u16))
+}
+
 fn draw_preview_column(buf: &mut Buffer, app: &App, x: usize, top: usize, width: usize, height: usize, t: &Theme) {
     let Some(entry) = app.current_dir().current() else {
         return;
@@ -368,7 +387,12 @@ fn draw_preview_column(buf: &mut Buffer, app: &App, x: usize, top: usize, width:
             draw_filelist(buf, dir, &app.tags, &app.settings, false, x, top, width, height, false, t);
         }
     } else if matches!(entry.ftype, FType::File) {
-        draw_file_preview(buf, app, x, top, width, height, t);
+        // Image/document previews are painted as terminal graphics over this box
+        // after the cell flush (see imgpreview) — leave the cells blank so text
+        // doesn't fight the image.
+        if !app.is_image_preview(&entry.path) {
+            draw_file_preview(buf, app, x, top, width, height, t);
+        }
     } else {
         let info = format!("({})", entry.ftype.name());
         buf.set_str(x, top, &util::truncate(&info, width), Style::new(t.info, t.bg));

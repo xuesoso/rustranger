@@ -36,11 +36,13 @@ copy/cut/paste (background, with progress + collision-safe naming),
 delete/rename/mkdir/touch/chmod, symlink/hardlink paste, tabs, persistent
 bookmarks, in-session tags, navigation history, automatic refresh when the
 visible directories change on disk (~0.5 s poll), a configurable size/date column,
-light & dark color themes, a `:` command console, key-chain hint menus, a
-scrollable `?` help, and opening files in external programs.
+light & dark color themes, optional in-pane image/PDF preview (kitty/sixel, via an
+external renderer), a `:` command console, key-chain hint menus, a scrollable `?`
+help, and opening files in external programs.
 
-**Dropped** vs. ranger (by design): image previews, VCS status decoration, the
-Python plugin system, `scope.sh` and external preview helpers, multipane view.
+**Dropped** vs. ranger (by design): VCS status decoration, the Python plugin
+system, `scope.sh` and external preview helpers, multipane view. (Image preview
+is opt-in through a configured external renderer — see below.)
 
 ## Keybindings
 
@@ -141,6 +143,43 @@ bg = "#11131a"      # tweak the background
 
 Roles: `bg`, `fg`, `border`, `title`, `accent`, `dir`, `link`, `exec`, `special`,
 `device`, `broken`, `warning`, `error`, `info`, `progress`.
+
+### In-pane image & document preview
+
+rustranger can show images and PDFs as terminal **graphics** in the preview pane
+(kitty graphics or sixel) instead of a text placeholder. It ships no renderer of
+its own — you point it, per extension, at an external tool that prints graphics
+escapes to stdout for a given cell box. [folio](https://github.com/xuesoso/folio)'s
+headless `folio print` does exactly that:
+
+```toml
+[settings]
+preview_protocol = "auto"    # auto (default) | kitty | sixel | iterm.
+                             # Inside tmux, auto asks the tmux server which client
+                             # is attached RIGHT NOW (env vars go stale across
+                             # re-attach): Ghostty/kitty → kitty, WezTerm → iterm,
+                             # else (incl. iTerm2) → tmux-native sixel. Outside
+                             # tmux: kitty on Ghostty/kitty/WezTerm, iterm (OSC
+                             # 1337) on iTerm2/VSCode, sixel elsewhere.
+
+[preview]
+pdf  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f"
+png  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f"
+jpg  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f"
+jpeg = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f"
+```
+
+Placeholders the command receives: `%f` file, `%p` protocol, `%x`/`%y` box
+top-left cell, `%c`/`%r` box size (cells), `%w`/`%h` cell size (pixels), and `%t`
+(expands to `--tmux` inside tmux). Anything else in the command is passed through
+verbatim, so you can add renderer options — e.g. `folio print … --theme nord
+--sharpness full …`. Needs a kitty-graphics terminal (Ghostty/kitty/WezTerm) or a
+sixel terminal; inside **tmux**, set `allow-passthrough on`.
+
+The render runs on a **background thread** and appears after a short pause, so
+cursor navigation and file operations never block on it; it clears when you move
+off the file or open an overlay. If the renderer isn't installed, previews are
+skipped silently. `rustranger gen-config` ships a ready-to-use `[preview]` section.
 
 ### Command-line overrides
 

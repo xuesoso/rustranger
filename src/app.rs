@@ -511,6 +511,17 @@ impl App {
         self.pending_run = Some(opener::open_file(path, self.cwd(), &self.settings.openers));
     }
 
+    /// The configured `[preview]` command for `path`, if its extension matches.
+    pub fn preview_command_for(&self, path: &Path) -> Option<&str> {
+        opener::command_for(path, &self.settings.preview_cmds)
+    }
+
+    /// Whether `path` has an image/document preview command configured (so the
+    /// preview pane shows terminal graphics for it rather than a text preview).
+    pub fn is_image_preview(&self, path: &Path) -> bool {
+        self.preview_command_for(path).is_some()
+    }
+
     /// Go to the parent directory, keeping the cursor on the directory we left.
     pub fn ascend(&mut self) {
         let cwd = self.cwd();
