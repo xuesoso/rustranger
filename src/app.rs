@@ -104,7 +104,14 @@ impl KeyMenu {
 
     /// The `y` (yank/copy) menu.
     pub fn yank() -> KeyMenu {
-        KeyMenu::from_static("yank", &[("y", "copy selection")])
+        KeyMenu::from_static(
+            "yank",
+            &[
+                ("y", "copy selection (files)"),
+                ("n", "copy name to clipboard"),
+                ("b", "copy base name, no extension"),
+            ],
+        )
     }
 
     /// The `d` (cut) menu.
@@ -598,6 +605,29 @@ impl App {
             self.current_dir_mut().set_mark_at_pointer(true);
             self.message = Some("-- VISUAL --".to_string());
         }
+    }
+
+    // ---- clipboard (file name) -------------------------------------------
+
+    /// Copy the focused entry's name to the system clipboard — with its extension
+    /// when `with_ext`, otherwise the base name (stem, e.g. `foo` from `foo.txt`).
+    pub fn yank_name(&mut self, with_ext: bool) {
+        let Some(path) = self.selected_path() else {
+            return;
+        };
+        let name = if with_ext {
+            path.file_name()
+        } else {
+            path.file_stem()
+        }
+        .map(|s| s.to_string_lossy().into_owned());
+        let Some(name) = name else {
+            return;
+        };
+        self.message = Some(match crate::clipboard::copy(&name) {
+            Ok(()) => format!("copied to clipboard: {}", name),
+            Err(e) => format!("clipboard error: {}", e),
+        });
     }
 
     // ---- copy / cut / paste ----------------------------------------------

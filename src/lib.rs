@@ -12,6 +12,7 @@
 #![allow(clippy::should_implement_trait)]
 
 pub mod app;
+pub mod clipboard;
 pub mod config;
 pub mod console;
 pub mod fs;

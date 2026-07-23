@@ -52,6 +52,7 @@ Python plugin system, `scope.sh` and external preview helpers, multipane view.
 | `Ctrl-d`/`Ctrl-u` | half-page down/up | `uv` | clear marks |
 | `J`/`K` | scroll preview | `yy` | copy |
 | `z` | toggle hidden | `dd` | cut |
+| `yn` / `yb` | copy name / base name (no ext) to clipboard | | |
 | `gh` / `g/` | home / root dir | `pp` | paste |
 | `H` / `L` | history back / forward | `pl` / `pL` | paste symlink (rel/abs) |
 | `Tab` / `BackTab` | next / prev tab | `ph` | paste hardlink |

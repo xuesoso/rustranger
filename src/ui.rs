@@ -195,6 +195,7 @@ const HELP: &[&str] = &[
     "",
     "File operations",
     "  yy                copy selection",
+    "  yn / yb           copy name / base name (no ext) to clipboard",
     "  dd                cut selection",
     "  pp                paste",
     "  pl / pL           paste symlink (relative / absolute)",

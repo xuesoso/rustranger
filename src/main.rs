@@ -510,11 +510,12 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
                     'f' => app.toggle_dirs_first(),
                     _ => {}
                 },
-                'y' => {
-                    if c == 'y' {
-                        app.copy()
-                    }
-                }
+                'y' => match c {
+                    'y' => app.copy(),
+                    'n' => app.yank_name(true),  // name with extension
+                    'b' => app.yank_name(false), // base name, no extension
+                    _ => {}
+                },
                 'd' => {
                     if c == 'd' {
                         app.cut()
