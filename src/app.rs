@@ -137,6 +137,17 @@ impl KeyMenu {
         KeyMenu::from_static("un-", &[("v", "clear marks"), ("m", "delete bookmark")])
     }
 
+    /// The `z` (toggle settings) menu, mirroring ranger's `z` prefix.
+    pub fn toggle() -> KeyMenu {
+        KeyMenu::from_static(
+            "toggle",
+            &[
+                ("h", "hidden files"),
+                ("i", "image/document preview"),
+            ],
+        )
+    }
+
     /// The `c` (change) menu.
     pub fn change() -> KeyMenu {
         KeyMenu::from_static("change", &[("w", "rename")])
@@ -519,7 +530,7 @@ impl App {
     /// Whether `path` has an image/document preview command configured (so the
     /// preview pane shows terminal graphics for it rather than a text preview).
     pub fn is_image_preview(&self, path: &Path) -> bool {
-        self.preview_command_for(path).is_some()
+        self.settings.preview_images && self.preview_command_for(path).is_some()
     }
 
     /// Go to the parent directory, keeping the cursor on the directory we left.
@@ -560,6 +571,20 @@ impl App {
         let settings = self.settings.clone();
         for dir in self.dirs.values_mut() {
             dir.refilter(&settings);
+        }
+    }
+
+    /// Toggle terminal-graphics previews for images/PDFs (ranger's `zi`). The new
+    /// state is written back to the config file so it persists across restarts;
+    /// turning it off makes the preview pane fall back to text on the next frame
+    /// (the image manager clears the graphics when the target stops being one).
+    pub fn toggle_preview_images(&mut self) {
+        self.settings.preview_images = !self.settings.preview_images;
+        let on = self.settings.preview_images;
+        let state = if on { "on" } else { "off" };
+        match crate::config::persist_setting("preview_images", if on { "true" } else { "false" }) {
+            Ok(()) => self.message = Some(format!("image preview: {state}")),
+            Err(e) => self.message = Some(format!("image preview: {state} (couldn't save: {e})")),
         }
     }
 

@@ -536,6 +536,12 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
                     'b' => app.yank_name(false), // base name, no extension
                     _ => {}
                 },
+                // Toggle settings (ranger's `z` prefix).
+                'z' => match c {
+                    'h' => app.toggle_hidden(),
+                    'i' => app.toggle_preview_images(),
+                    _ => {}
+                },
                 'd' => {
                     if c == 'd' {
                         app.cut()
@@ -612,7 +618,10 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
         (KeyCode::Char('l'), false) | (KeyCode::Right, false) | (KeyCode::Enter, _) => app.enter(),
         (KeyCode::Char('G'), false) => app.move_to_bottom(),
         (KeyCode::Char('D'), false) => app.request_delete(),
-        (KeyCode::Char('z'), false) => app.toggle_hidden(),
+        (KeyCode::Char('z'), false) => {
+            *pending = Some('z');
+            app.menu = Some(app::KeyMenu::toggle());
+        }
         (KeyCode::Char('J'), false) => app.scroll_preview(3),
         (KeyCode::Char('K'), false) => app.scroll_preview(-3),
         (KeyCode::Char(' '), false) => app.toggle_mark(),

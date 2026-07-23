@@ -79,6 +79,10 @@ pub struct Settings {
     pub column_ratios: Vec<u32>,
     pub preview_files: bool,
     pub preview_directories: bool,
+    /// Whether image/document files get a terminal-graphics preview. When off,
+    /// they fall back to the text preview. Toggled at runtime (ranger's `zi`)
+    /// and persisted back to the config file.
+    pub preview_images: bool,
     pub draw_borders: bool,
     /// Show the date column (next to size) in the current column's file list.
     pub show_date: bool,
@@ -232,6 +236,7 @@ impl Settings {
             }
             "preview_files" => self.preview_files = as_bool(value),
             "preview_directories" => self.preview_directories = as_bool(value),
+            "preview_images" => self.preview_images = as_bool(value),
             "draw_borders" => self.draw_borders = as_bool(value),
             "show_date" | "show_time" => self.show_date = as_bool(value),
             "time_type" => {
@@ -331,6 +336,7 @@ sort_directories_first = true
 sort_case_insensitive = true
 column_ratios = \"1,3,4\"         # parent : current : preview
 preview_files = true
+preview_images = true          # terminal-graphics preview for images/PDFs (toggle: zi)
 draw_borders = true
 confirm_on_delete = true
 wrap_scroll = false
@@ -412,6 +418,90 @@ pub fn generate_default_config() -> std::io::Result<GenConfig> {
     Ok(GenConfig::Created(path))
 }
 
+/// Persist a single `[settings]` key back to the on-disk config file so a
+/// runtime toggle (e.g. `zi`) survives restarts. Only that one `key = value`
+/// line is rewritten — the rest of the user's file, comments and all, is left
+/// untouched. If the key is absent it is inserted under `[settings]`; if no
+/// config file exists yet, one is seeded from the annotated default template.
+pub fn persist_setting(key: &str, value: &str) -> std::io::Result<()> {
+    let path = config_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no config directory (set HOME or XDG_CONFIG_HOME)",
+        )
+    })?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_CONFIG.to_string(),
+        Err(e) => return Err(e),
+    };
+    let updated = upsert_setting(&text, key, value);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, updated)
+}
+
+/// Return `text` with the `[settings]` entry `key` set to `value`. An existing
+/// active *or* commented-out `key = …` line inside `[settings]` is replaced in
+/// place (preserving any trailing `# comment`); otherwise the assignment is
+/// inserted just below the `[settings]` header, which is created if missing.
+fn upsert_setting(text: &str, key: &str, value: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_settings = false;
+    let mut settings_hdr: Option<usize> = None;
+    let mut done = false;
+
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_settings = trimmed == "[settings]";
+            if in_settings {
+                settings_hdr = Some(out.len());
+            }
+            out.push(raw.to_string());
+            continue;
+        }
+        // Match an active or commented `key = …` assignment inside [settings].
+        if in_settings && !done {
+            let body = trimmed.trim_start_matches('#').trim_start();
+            if let Some((k, rest)) = body.split_once('=') {
+                if k.trim() == key {
+                    let comment = &rest[strip_comment(rest).len()..];
+                    out.push(if comment.is_empty() {
+                        format!("{key} = {value}")
+                    } else {
+                        format!("{key} = {value}  {comment}")
+                    });
+                    done = true;
+                    continue;
+                }
+            }
+        }
+        out.push(raw.to_string());
+    }
+
+    if !done {
+        let line = format!("{key} = {value}");
+        match settings_hdr {
+            Some(i) => out.insert(i + 1, line),
+            None => {
+                if out.last().is_some_and(|l| !l.trim().is_empty()) {
+                    out.push(String::new());
+                }
+                out.push("[settings]".to_string());
+                out.push(line);
+            }
+        }
+    }
+
+    let mut joined = out.join("\n");
+    if text.ends_with('\n') || text.is_empty() {
+        joined.push('\n');
+    }
+    joined
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -423,6 +513,7 @@ impl Default for Settings {
             column_ratios: vec![1, 3, 4],
             preview_files: true,
             preview_directories: true,
+            preview_images: true,
             draw_borders: true,
             show_date: true,
             time_type: TimeType::Modified,
@@ -481,6 +572,53 @@ mod tests {
         assert!(s.preview_cmds.iter().any(|(e, c)| e == "pdf" && c.contains("folio print")));
         assert!(s.preview_cmds.iter().any(|(e, _)| e == "png"));
         assert!(s.preview_cmds.iter().any(|(e, _)| e == "jpeg"));
+        // Image preview is on by default.
+        assert!(s.preview_images);
+    }
+
+    #[test]
+    fn upsert_replaces_active_line_and_keeps_comment() {
+        let text = "[settings]\npreview_images = true   # graphics preview\nshow_hidden = false\n";
+        let out = upsert_setting(text, "preview_images", "false");
+        assert!(out.contains("preview_images = false"));
+        assert!(out.contains("# graphics preview"), "trailing comment preserved: {out:?}");
+        assert!(!out.contains("preview_images = true"));
+        // Untouched lines survive, trailing newline kept.
+        assert!(out.contains("show_hidden = false"));
+        assert!(out.ends_with('\n'));
+        // The rewritten value round-trips through the parser.
+        let mut s = Settings::default();
+        s.apply_toml(&out);
+        assert!(!s.preview_images);
+    }
+
+    #[test]
+    fn upsert_uncomments_a_commented_key() {
+        let text = "[settings]\n# preview_images = true\n";
+        let out = upsert_setting(text, "preview_images", "false");
+        assert!(out.contains("preview_images = false"));
+        assert!(!out.contains("# preview_images"), "no longer commented: {out:?}");
+    }
+
+    #[test]
+    fn upsert_inserts_missing_key_under_settings() {
+        let text = "[settings]\nshow_hidden = true\n\n[preview]\npng = \"folio\"\n";
+        let out = upsert_setting(text, "preview_images", "false");
+        // Inserted under [settings], not into [preview].
+        let settings_pos = out.find("[settings]").unwrap();
+        let preview_pos = out.find("[preview]").unwrap();
+        let key_pos = out.find("preview_images = false").expect("inserted");
+        assert!(settings_pos < key_pos && key_pos < preview_pos, "placed in [settings]: {out:?}");
+    }
+
+    #[test]
+    fn upsert_creates_settings_section_when_absent() {
+        let out = upsert_setting("[open]\ncsv = \"x\"\n", "preview_images", "false");
+        assert!(out.contains("[settings]"));
+        assert!(out.contains("preview_images = false"));
+        let mut s = Settings::default();
+        s.apply_toml(&out);
+        assert!(!s.preview_images);
     }
 
     #[test]

@@ -53,7 +53,7 @@ is opt-in through a configured external renderer — see below.)
 | `gg` / `G` | top / bottom | `V` | toggle all marks |
 | `Ctrl-d`/`Ctrl-u` | half-page down/up | `uv` | clear marks |
 | `J`/`K` | scroll preview | `yy` | copy |
-| `z` | toggle hidden | `dd` | cut |
+| `zh` / `zi` | toggle hidden / image preview | `dd` | cut |
 | `yn` / `yb` | copy name / base name (no ext) to clipboard | | |
 | `gh` / `g/` | home / root dir | `pp` | paste |
 | `H` / `L` | history back / forward | `pl` / `pL` | paste symlink (rel/abs) |
@@ -66,7 +66,7 @@ is opt-in through a configured external renderer — see below.)
 | `:` | command console | `q` / `Q` | close tab / quit all |
 | `?` | help (scrollable key list) | | |
 
-Pressing a multi-key prefix (`o`, `g`, `d`, `y`, `p`, `u`, `c`, `m`, `` ` ``) pops
+Pressing a multi-key prefix (`o`, `g`, `d`, `y`, `p`, `u`, `c`, `z`, `m`, `` ` ``) pops
 up a hint menu listing the keys that complete it — like ranger's keychain hints.
 Press `?` for a full scrollable list of every binding.
 
