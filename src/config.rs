@@ -374,6 +374,8 @@ theme = \"default\"              # default|gruvbox-dark|gruvbox-light|solarized-
 # If the renderer isn't found, previews are simply skipped (no error). Placeholders:
 #   %f file  %p protocol  %x col  %y row  %c cols  %r rows
 #   %w cell-width-px  %h cell-height-px  %t (expands to --tmux inside tmux)
+#   %b theme background as RRGGBB (or \"none\" for terminal-default themes) —
+#      folio fills the preview box with it so the box matches the UI theme
 # preview_protocol = \"auto\"   # auto (default) | kitty | sixel | iterm
 #                              # In tmux, auto asks the tmux server which client is
 #                              # attached now: Ghostty/kitty -> kitty, WezTerm ->
@@ -381,10 +383,10 @@ theme = \"default\"              # default|gruvbox-dark|gruvbox-light|solarized-
 #                              # Outside tmux: kitty on Ghostty/kitty/WezTerm,
 #                              # iterm on iTerm2/VSCode, sixel elsewhere.
 [preview]
-pdf  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f\"
-png  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f\"
-jpg  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f\"
-jpeg = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f\"
+pdf  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f\"
+png  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f\"
+jpg  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f\"
+jpeg = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f\"
 ";
 
 /// Outcome of generating the default config file.

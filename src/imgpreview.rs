@@ -40,6 +40,10 @@ struct Shown {
     /// cell grid, so clearing needs a full cell repaint (kitty has a delete cmd).
     sixel: bool,
     tmux: bool,
+    /// Theme background at draw time — the box is repainted with it on clear, so
+    /// transitions never flash the terminal's own background (the kitty-in-tmux
+    /// placeholder cells are written outside our cell model with an unknown bg).
+    bg: crossterm::style::Color,
 }
 
 /// A render running on a background thread; its result arrives over `rx`.
@@ -48,6 +52,7 @@ struct Inflight {
     rect: Rect,
     sixel: bool,
     tmux: bool,
+    bg: crossterm::style::Color,
     rx: Receiver<Result<Vec<u8>, String>>,
 }
 
@@ -118,6 +123,7 @@ impl ImagePreview {
                                     rect: inf.rect,
                                     sixel: inf.sixel,
                                     tmux: inf.tmux,
+                                    bg: inf.bg,
                                 });
                             }
                             // Nothing to show (renderer missing) or it failed:
@@ -177,15 +183,33 @@ impl ImagePreview {
     /// Remove the displayed image, if any. Returns `true` if a full repaint is
     /// needed (sixel).
     pub fn clear(&mut self, out: &mut impl Write) -> io::Result<bool> {
+        use crossterm::cursor::MoveTo;
+        use crossterm::style::{Print, ResetColor, SetBackgroundColor};
+
         let Some(s) = self.shown.take() else {
             return Ok(false);
         };
+        let mut seq: Vec<u8> = Vec::new();
         // Kitty: delete the image by id (a clean overlay removal). Harmless when
         // the image was sixel (there is no such kitty image).
         let del = format!("\x1b_Ga=d,d=I,i={KITTY_IMAGE_ID}\x1b\\");
-        out.write_all(&maybe_tmux(del.as_bytes(), s.tmux))?;
+        seq.extend_from_slice(&maybe_tmux(del.as_bytes(), s.tmux));
+        // Repaint the box with the theme background so the transition never
+        // flashes the terminal's own background: the kitty-in-tmux placeholder
+        // cells were written outside our cell model (with an unknown bg), and
+        // sixel/iterm pixels are erased by cell writes in most terminals. This
+        // matches the diff model (blank theme-bg cells), so it stays consistent.
+        let (x, top, cols, rows) = s.rect;
+        let blank = " ".repeat(cols as usize);
+        let _ = crossterm::queue!(seq, SetBackgroundColor(s.bg));
+        for r in 0..rows {
+            let _ = crossterm::queue!(seq, MoveTo(x, top + r), Print(&blank));
+        }
+        let _ = crossterm::queue!(seq, ResetColor);
+        out.write_all(&seq)?;
         out.flush()?;
-        // Sixel pixels are baked into the cell area, so ask for a full repaint.
+        // Sixel/iterm pixels may survive cell overwrites on some terminals; keep
+        // the full repaint as the reliable eraser there. Kitty needs none.
         Ok(s.sixel)
     }
 
@@ -211,22 +235,25 @@ impl ImagePreview {
         let proto = resolve_protocol(app.settings.preview_protocol);
         let (cell_w, cell_h) = cell_pixel_size();
         let tmux = in_tmux();
+        let bg = theme_bg_hex(app);
         let (tx, rx) = mpsc::channel();
         let p = path.clone();
         thread::spawn(move || {
-            let _ = tx.send(run_renderer(&tmpl, &p, rect, proto, cell_w, cell_h, tmux));
+            let _ = tx.send(run_renderer(&tmpl, &p, rect, proto, cell_w, cell_h, tmux, &bg));
         });
         self.inflight = Some(Inflight {
             path,
             rect,
             sixel: proto != "kitty", // sixel + iterm both clear by repaint
             tmux,
+            bg: app.settings.theme.bg,
             rx,
         });
     }
 }
 
 /// Run the renderer command (placeholders substituted) and capture its stdout.
+#[allow(clippy::too_many_arguments)]
 fn run_renderer(
     template: &str,
     path: &Path,
@@ -235,6 +262,7 @@ fn run_renderer(
     cell_w: u16,
     cell_h: u16,
     tmux: bool,
+    bg: &str,
 ) -> Result<Vec<u8>, String> {
     let (x, y, c, r) = rect;
     let path_str = path.to_string_lossy();
@@ -251,6 +279,7 @@ fn run_renderer(
                 .replace("%r", &r.to_string())
                 .replace("%w", &cell_w.to_string())
                 .replace("%h", &cell_h.to_string())
+                .replace("%b", bg)
                 .replace("%t", if tmux { "--tmux" } else { "" })
         })
         .filter(|s| !s.is_empty())
@@ -355,6 +384,16 @@ fn vscode() -> bool {
     matches!(std::env::var("TERM_PROGRAM").ok().as_deref(), Some("vscode"))
 }
 
+/// The theme background as an `RRGGBB` hex string for the `%b` placeholder, or
+/// "none" when the theme uses the terminal's own background (Reset / named /
+/// indexed colors have no portable RGB value to hand a renderer).
+fn theme_bg_hex(app: &App) -> String {
+    match app.settings.theme.bg {
+        crossterm::style::Color::Rgb { r, g, b } => format!("{r:02x}{g:02x}{b:02x}"),
+        _ => "none".to_string(),
+    }
+}
+
 /// Detection of iTerm2 (env-based; `LC_TERMINAL` covers ssh sessions).
 fn iterm_capable() -> bool {
     std::env::var_os("ITERM_SESSION_ID").is_some()
@@ -366,29 +405,58 @@ fn in_tmux() -> bool {
     std::env::var_os("TMUX").is_some()
 }
 
+/// Ask tmux for a format expansion, targeted at OUR pane's session so the answer
+/// reflects the client actually viewing this pane (a server can have several
+/// sessions/clients attached from different terminals).
+fn tmux_display(fmt: &str) -> Option<String> {
+    let mut cmd = Command::new("tmux");
+    cmd.arg("display-message");
+    if let Some(pane) = std::env::var_os("TMUX_PANE") {
+        cmd.arg("-t").arg(pane);
+    }
+    let out = cmd.args(["-p", fmt]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
 /// TERM of the client currently attached to the tmux session (lowercased), e.g.
 /// "xterm-ghostty" / "xterm-kitty" / "xterm-256color". Unlike pane env vars,
 /// this tracks re-attaching from a different terminal emulator.
 fn tmux_client_term() -> Option<String> {
-    let out = Command::new("tmux")
-        .args(["display-message", "-p", "#{client_termname}"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
-    if name.is_empty() { None } else { Some(name) }
+    tmux_display("#{client_termname}").map(|s| s.to_lowercase())
 }
 
-/// Pixel size of one cell, via `TIOCGWINSZ` (falls back to a common 8×16).
+/// Pixel size of one cell. Inside tmux the pane pty reports no pixel size, but
+/// the tmux server knows the attached client's cell size exactly — using it
+/// keeps the rendered canvas aligned to real cell boundaries (a wrong guess
+/// leaves sub-cell slivers at the image's right/bottom edges that terminals
+/// fill with the sixel background, i.e. white strips). Outside tmux, TIOCGWINSZ;
+/// falls back to a common 8×16.
 fn cell_pixel_size() -> (u16, u16) {
+    if in_tmux() {
+        if let Some(wh) = tmux_cell_size() {
+            return wh;
+        }
+    }
     if let Ok(ws) = crossterm::terminal::window_size() {
         if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 {
             return (ws.width / ws.columns, ws.height / ws.rows);
         }
     }
     (8, 16)
+}
+
+/// The attached tmux client's cell size in pixels (tracks re-attaching from a
+/// different terminal, like [`tmux_client_term`]).
+fn tmux_cell_size() -> Option<(u16, u16)> {
+    let s = tmux_display("#{client_cell_width} #{client_cell_height}")?;
+    let mut it = s.split_whitespace();
+    let w: u16 = it.next()?.parse().ok()?;
+    let h: u16 = it.next()?.parse().ok()?;
+    (w > 0 && h > 0).then_some((w, h))
 }
 
 /// Wrap a control sequence for tmux passthrough when `tmux` is set (double each

@@ -163,14 +163,14 @@ preview_protocol = "auto"    # auto (default) | kitty | sixel | iterm.
                              # 1337) on iTerm2/VSCode, sixel elsewhere.
 
 [preview]
-pdf  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f"
-png  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f"
-jpg  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f"
-jpeg = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h %t %f"
+pdf  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f"
+png  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f"
+jpg  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f"
+jpeg = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f"
 ```
 
 Placeholders the command receives: `%f` file, `%p` protocol, `%x`/`%y` box
-top-left cell, `%c`/`%r` box size (cells), `%w`/`%h` cell size (pixels), and `%t`
+top-left cell, `%c`/`%r` box size (cells), `%w`/`%h` cell size (pixels), `%b` the theme background as RRGGBB, and `%t`
 (expands to `--tmux` inside tmux). Anything else in the command is passed through
 verbatim, so you can add renderer options — e.g. `folio print … --theme nord
 --sharpness full …`. Needs a kitty-graphics terminal (Ghostty/kitty/WezTerm) or a
