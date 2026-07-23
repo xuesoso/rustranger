@@ -31,7 +31,32 @@ const KITTY_IMAGE_ID: u32 = 0x0070_6466;
 /// scrolling through a directory of images doesn't spawn a renderer per file.
 const DEBOUNCE: Duration = Duration::from_millis(90);
 
-type Rect = (u16, u16, u16, u16); // (x, top, cols, rows) in cells
+pub type Rect = (u16, u16, u16, u16); // (x, top, cols, rows) in cells
+
+/// What `sync` did this frame that the caller's cell-diff model must account for.
+#[derive(Default)]
+pub struct SyncOutcome {
+    /// A preview-box rect that was blanked *directly on-screen* (outside the cell
+    /// diff) while removing an image. The caller must blank the same cells in its
+    /// diff baseline, so anything overlapping the box — e.g. a key-chain menu
+    /// popup — is repainted next frame instead of staying hidden under the image
+    /// we just erased.
+    pub cleared: Option<Rect>,
+    /// The removed image used sixel/iTerm2 pixels; force a full repaint so any
+    /// pixels a cell overwrite didn't erase are cleaned up.
+    pub needs_full: bool,
+}
+
+impl SyncOutcome {
+    /// Fold a `clear()` result into the outcome. At most one clear does real work
+    /// per `sync` (the first empties `shown`), so this records that rect.
+    fn record_clear(&mut self, cleared: Option<(Rect, bool)>) {
+        if let Some((rect, sixel)) = cleared {
+            self.cleared = Some(rect);
+            self.needs_full |= sixel;
+        }
+    }
+}
 
 struct Shown {
     path: PathBuf,
@@ -91,16 +116,16 @@ impl ImagePreview {
     }
 
     /// Reconcile the displayed image with the current selection, non-blocking.
-    /// Returns `true` when the caller should force a full repaint next frame (a
-    /// sixel image was cleared and its pixels must be painted over).
+    /// The returned [`SyncOutcome`] tells the caller how to keep its cell-diff
+    /// baseline in step with what was drawn/erased directly on-screen.
     pub fn sync(
         &mut self,
         out: &mut impl Write,
         app: &mut App,
         cols: usize,
         rows: usize,
-    ) -> io::Result<bool> {
-        let mut needs_full = false;
+    ) -> io::Result<SyncOutcome> {
+        let mut res = SyncOutcome::default();
         let desired = self.desired(app, cols, rows);
 
         // 1. Collect a finished background render and display it — but only if it
@@ -115,7 +140,7 @@ impl ImagePreview {
                     if still_wanted {
                         match result {
                             Ok(bytes) if !bytes.is_empty() => {
-                                needs_full |= self.clear(out)?;
+                                res.record_clear(self.clear(out)?);
                                 out.write_all(&bytes)?;
                                 out.flush()?;
                                 self.shown = Some(Shown {
@@ -146,25 +171,25 @@ impl ImagePreview {
             None => {
                 self.pending = None;
                 self.attempted = None; // a failed target may be retried on revisit
-                needs_full |= self.clear(out)?;
+                res.record_clear(self.clear(out)?);
             }
             Some((path, rect)) => {
                 if self.shown.as_ref().is_some_and(|s| s.path == path && s.rect == rect) {
                     self.pending = None;
-                    return Ok(needs_full);
+                    return Ok(res);
                 }
                 // Remove a stale image now so nothing lingers while we render.
-                needs_full |= self.clear(out)?;
+                res.record_clear(self.clear(out)?);
                 // Already rendering exactly this — just wait for it.
                 if self.inflight.as_ref().is_some_and(|i| i.path == path && i.rect == rect) {
                     self.pending = None;
-                    return Ok(needs_full);
+                    return Ok(res);
                 }
                 // Already tried this exact target and it produced nothing (failed
                 // or renderer missing) — don't spin retrying it every tick.
                 if self.attempted.as_ref().is_some_and(|(p, r)| *p == path && *r == rect) {
                     self.pending = None;
-                    return Ok(needs_full);
+                    return Ok(res);
                 }
                 // Debounce, then kick off a background render.
                 let ready = matches!(&self.pending, Some((p, since))
@@ -177,17 +202,19 @@ impl ImagePreview {
                 }
             }
         }
-        Ok(needs_full)
+        Ok(res)
     }
 
-    /// Remove the displayed image, if any. Returns `true` if a full repaint is
-    /// needed (sixel).
-    pub fn clear(&mut self, out: &mut impl Write) -> io::Result<bool> {
+    /// Remove the displayed image, if any. Returns the box rect that was blanked
+    /// on-screen and whether the image used sixel/iTerm2 pixels (so the caller can
+    /// re-sync its diff baseline and, for sixel, force a full repaint). `None`
+    /// when nothing was shown.
+    pub fn clear(&mut self, out: &mut impl Write) -> io::Result<Option<(Rect, bool)>> {
         use crossterm::cursor::MoveTo;
         use crossterm::style::{Print, ResetColor, SetBackgroundColor};
 
         let Some(s) = self.shown.take() else {
-            return Ok(false);
+            return Ok(None);
         };
         let mut seq: Vec<u8> = Vec::new();
         // Kitty: delete the image by id (a clean overlay removal). Harmless when
@@ -210,7 +237,7 @@ impl ImagePreview {
         out.flush()?;
         // Sixel/iterm pixels may survive cell overwrites on some terminals; keep
         // the full repaint as the reliable eraser there. Kitty needs none.
-        Ok(s.sixel)
+        Ok(Some((s.rect, s.sixel)))
     }
 
     /// Which image (path + preview-box rect) should be showing right now, if any.
@@ -475,4 +502,57 @@ fn maybe_tmux(seq: &[u8], tmux: bool) -> Vec<u8> {
     }
     out.extend_from_slice(b"\x1b\\");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::style::Color;
+
+    fn shown(rect: Rect, sixel: bool) -> Shown {
+        Shown { path: PathBuf::from("/img.png"), rect, sixel, tmux: false, bg: Color::Reset }
+    }
+
+    #[test]
+    fn clear_reports_blanked_rect_and_forgets_image() {
+        let mut ip = ImagePreview::new();
+        ip.shown = Some(shown((10, 1, 20, 15), false));
+        let mut out: Vec<u8> = Vec::new();
+
+        // The rect is reported so the caller can re-sync its diff baseline (this
+        // is what stops a menu popup over the preview box from staying hidden).
+        assert_eq!(ip.clear(&mut out).unwrap(), Some(((10, 1, 20, 15), false)));
+        assert!(ip.shown.is_none(), "image forgotten after clear");
+        // Nothing shown now → nothing to re-sync.
+        assert_eq!(ip.clear(&mut out).unwrap(), None);
+    }
+
+    #[test]
+    fn clear_flags_sixel_for_full_repaint_but_not_kitty() {
+        let mut out: Vec<u8> = Vec::new();
+
+        let mut kitty = ImagePreview::new();
+        kitty.shown = Some(shown((0, 0, 4, 4), false));
+        assert_eq!(kitty.clear(&mut out).unwrap().map(|(_, s)| s), Some(false));
+
+        let mut sixel = ImagePreview::new();
+        sixel.shown = Some(shown((0, 0, 4, 4), true));
+        assert_eq!(sixel.clear(&mut out).unwrap().map(|(_, s)| s), Some(true));
+    }
+
+    #[test]
+    fn sync_outcome_folds_clear_results() {
+        let mut r = SyncOutcome::default();
+        r.record_clear(None);
+        assert!(r.cleared.is_none() && !r.needs_full);
+
+        // A kitty clear records the rect without demanding a full repaint.
+        r.record_clear(Some(((1, 2, 3, 4), false)));
+        assert_eq!(r.cleared, Some((1, 2, 3, 4)));
+        assert!(!r.needs_full);
+
+        // A sixel clear escalates to a full repaint.
+        r.record_clear(Some(((5, 6, 7, 8), true)));
+        assert!(r.needs_full);
+    }
 }

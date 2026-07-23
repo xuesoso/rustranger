@@ -256,8 +256,21 @@ fn run(app: &mut App) -> io::Result<()> {
             // Paint (or clear) the in-pane image preview over the just-flushed
             // cells. A sixel clear needs its pixels painted over, so it asks for a
             // full repaint next frame.
-            if img.sync(&mut out, app, cols, rows)? {
+            let sync = img.sync(&mut out, app, cols, rows)?;
+            if sync.needs_full {
                 needs_full = true;
+            }
+            // `clear` blanked this preview-box rect directly on-screen, outside the
+            // cell diff. Blank the same cells in `cur` (which becomes the next diff
+            // baseline) so the following frame repaints whatever now belongs there —
+            // notably a key-chain menu popup overlapping the box, which would else
+            // stay hidden under the image we just erased.
+            if let Some((bx, btop, bw, bh)) = sync.cleared {
+                let blank = Style::new(app.settings.theme.fg, app.settings.theme.bg);
+                let spaces = " ".repeat(bw as usize);
+                for r in 0..bh {
+                    cur.set_str(bx as usize, (btop + r) as usize, &spaces, blank);
+                }
             }
             // Snapshot the displayed frame as the next diff baseline. Swapping
             // buffers (instead of cloning) avoids a fresh allocation and a full
