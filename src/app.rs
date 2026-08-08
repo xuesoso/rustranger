@@ -144,6 +144,7 @@ impl KeyMenu {
             &[
                 ("h", "hidden files"),
                 ("i", "image/document preview"),
+                ("m", "mouse support"),
             ],
         )
     }
@@ -571,6 +572,37 @@ impl App {
         let settings = self.settings.clone();
         for dir in self.dirs.values_mut() {
             dir.refilter(&settings);
+        }
+    }
+
+    /// Move the cursor to a visible index in the current directory (mouse click).
+    pub fn select_index(&mut self, index: usize) {
+        self.current_dir_mut().move_to(index);
+    }
+
+    /// Enter a directory clicked in the *parent* column. Files there are ignored:
+    /// a click in the parent column means "go to this directory", never "open".
+    pub fn enter_parent_entry(&mut self, index: usize) {
+        let target = self
+            .parent_path()
+            .and_then(|p| self.get_cached(&p))
+            .and_then(|dir| dir.entry_at(index))
+            .filter(|e| e.is_dir() && e.accessible)
+            .map(|e| e.path.clone());
+        if let Some(path) = target {
+            self.cd(path);
+        }
+    }
+
+    /// Toggle mouse reporting (ranger's `zm`), persisted like the other `z`
+    /// toggles. The run loop applies the change to the terminal on the next frame.
+    pub fn toggle_mouse(&mut self) {
+        self.settings.mouse_enabled = !self.settings.mouse_enabled;
+        let on = self.settings.mouse_enabled;
+        let state = if on { "on" } else { "off" };
+        match crate::config::persist_setting("mouse_enabled", if on { "true" } else { "false" }) {
+            Ok(()) => self.message = Some(format!("mouse: {state}")),
+            Err(e) => self.message = Some(format!("mouse: {state} (couldn't save: {e})")),
         }
     }
 

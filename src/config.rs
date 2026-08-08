@@ -96,6 +96,10 @@ pub struct Settings {
     pub theme: Theme,
     pub confirm_on_delete: bool,
     pub wrap_scroll: bool,
+    /// Report mouse events (wheel scrolls, left click enters, right click goes up).
+    /// While on, the terminal's own click-drag text selection needs the usual
+    /// override modifier (Shift, or Option/Alt on macOS) — hence the `zm` toggle.
+    pub mouse_enabled: bool,
     /// Names matching this are treated as hidden (in addition to dotfiles).
     pub hidden_filter_dotfiles: bool,
     /// Per-extension open commands from the `[open]` config section: pairs of
@@ -266,6 +270,7 @@ impl Settings {
             }
             "confirm_on_delete" => self.confirm_on_delete = as_bool(value),
             "wrap_scroll" => self.wrap_scroll = as_bool(value),
+            "mouse_enabled" => self.mouse_enabled = as_bool(value),
             _ => {}
         }
     }
@@ -340,6 +345,8 @@ preview_images = true          # terminal-graphics preview for images/PDFs (togg
 draw_borders = true
 confirm_on_delete = true
 wrap_scroll = false
+mouse_enabled = true           # wheel scrolls, left click enters, right click goes up
+                               # (toggle: zm — turn off for native text selection)
 show_date = true               # date column next to the size (current column)
 time_type = \"modified\"         # modified|created|changed|accessed
 time_format = \"date\"           # date (YYYY/MM/DD) | datetime (YYYY/MM/DD/HH/MM)
@@ -522,6 +529,7 @@ impl Default for Settings {
             theme: Theme::default(),
             confirm_on_delete: true,
             wrap_scroll: false,
+            mouse_enabled: true,
             hidden_filter_dotfiles: true,
             openers: Vec::new(),
             preview_cmds: Vec::new(),
@@ -572,8 +580,9 @@ mod tests {
         assert!(s.preview_cmds.iter().any(|(e, c)| e == "pdf" && c.contains("folio print")));
         assert!(s.preview_cmds.iter().any(|(e, _)| e == "png"));
         assert!(s.preview_cmds.iter().any(|(e, _)| e == "jpeg"));
-        // Image preview is on by default.
+        // Image preview and mouse support are on by default.
         assert!(s.preview_images);
+        assert!(s.mouse_enabled);
     }
 
     #[test]

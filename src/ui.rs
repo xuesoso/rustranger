@@ -232,11 +232,17 @@ const HELP: &[&str] = &[
     "View, search & console",
     "  zh                toggle hidden files",
     "  zi                toggle image/document preview",
+    "  zm                toggle mouse support",
     "  / , n / N         search, next / previous match",
     "  :                 command console (mkdir, touch, chmod, filter, set, …)",
     "  S                 run a shell command",
     "  r                 open selection with a program",
     "  ?                 this help",
+    "",
+    "Mouse  (zm toggles; hold Shift/Option for terminal text selection)",
+    "  wheel             scroll the list — or the preview, over that pane",
+    "  left click        select and enter/open (like l)",
+    "  right click       go to the parent directory (like h)",
 ];
 
 /// Number of help lines (used by the key handler to clamp scrolling).
@@ -358,6 +364,72 @@ fn column_layout(cols: usize, ratios: &[u32]) -> Vec<(usize, usize)> {
         x += w + 1;
     }
     out
+}
+
+/// What sits at a given screen cell — the inverse of [`draw_miller`]'s layout,
+/// used to route mouse clicks and wheel events to the right pane.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hit {
+    /// An entry in the parent column, by index into that directory's visible list.
+    Parent(usize),
+    /// An entry in the current (main) column, by index into its visible list.
+    Current(usize),
+    /// Anywhere inside the preview pane.
+    Preview,
+    /// Chrome or dead space: title bar, status bar, a column separator, or a row
+    /// past the end of a short listing.
+    Nothing,
+}
+
+/// Map a terminal cell `(x, y)` to what is drawn there. Mirrors `render` +
+/// `draw_miller` + `draw_filelist` exactly — including the scroll offset — so a
+/// click lands on the row the user actually sees.
+pub fn hit_test(app: &App, cols: usize, rows: usize, x: u16, y: u16) -> Hit {
+    if rows < 3 || cols < 4 {
+        return Hit::Nothing;
+    }
+    let (x, y) = (x as usize, y as usize);
+
+    // Row 0 is the title bar and the last row is the status/console bar.
+    let (body_top, body_height) = (1usize, rows - 2);
+    if y < body_top || y >= body_top + body_height {
+        return Hit::Nothing;
+    }
+
+    let layout = column_layout(cols, &app.settings.column_ratios);
+    let n = layout.len();
+    // A click in the 1-cell gap/border between panes belongs to neither.
+    let Some(i) = layout.iter().position(|&(cx, w)| x >= cx && x < cx + w) else {
+        return Hit::Nothing;
+    };
+
+    let is_preview = i + 1 == n && n > 1;
+    let is_main = i + 1 == n - 1 || n == 1;
+    if is_preview {
+        return Hit::Preview;
+    }
+
+    // Non-preview, non-main columns all show the parent directory (as drawn).
+    let dir = if is_main {
+        Some(app.current_dir())
+    } else {
+        app.parent_path().and_then(|p| app.get_cached(&p))
+    };
+    let Some(dir) = dir else { return Hit::Nothing };
+    // An error or "(empty)" placeholder occupies the column instead of a list.
+    if dir.error.is_some() || dir.is_empty() {
+        return Hit::Nothing;
+    }
+
+    let idx = scroll_begin(dir.pointer, dir.len(), body_height) + (y - body_top);
+    if idx >= dir.len() {
+        return Hit::Nothing; // blank rows below a short listing
+    }
+    if is_main {
+        Hit::Current(idx)
+    } else {
+        Hit::Parent(idx)
+    }
 }
 
 /// The preview column's cell rectangle `(x, top, width, height)`, matching what
@@ -696,6 +768,56 @@ mod tests {
         assert!(render(&mut tiny, &app).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mouse hit-testing must invert the miller layout exactly: the right pane,
+    /// the right entry, and nothing at all for chrome or dead space.
+    #[test]
+    fn hit_test_maps_cells_to_panes_and_rows() {
+        use super::{hit_test, Hit};
+
+        // base/sub/{file_00..file_99}, opened at `sub` so the parent column is
+        // deterministic: it lists exactly one entry ("sub").
+        let base = std::env::temp_dir().join(format!("rr_hit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..100 {
+            std::fs::write(sub.join(format!("file_{:02}", i)), b"x").unwrap();
+        }
+        let mut app = App::new(sub.clone(), Settings::default());
+        app.prepare_view();
+
+        // Default ratios 1:3:4 at 80 cols → parent x0..8, main x10..39, preview x41..
+        let (cols, rows) = (80usize, 24usize);
+
+        // Chrome is never a target.
+        assert_eq!(hit_test(&app, cols, rows, 20, 0), Hit::Nothing, "title bar");
+        let last = rows as u16 - 1;
+        assert_eq!(hit_test(&app, cols, rows, 20, last), Hit::Nothing, "status bar");
+        assert_eq!(hit_test(&app, cols, rows, 9, 1), Hit::Nothing, "column separator");
+
+        // Main column: the first body row is the first visible entry.
+        assert_eq!(hit_test(&app, cols, rows, 20, 1), Hit::Current(0));
+        assert_eq!(hit_test(&app, cols, rows, 20, 5), Hit::Current(4));
+
+        // Preview pane, and the parent column's single entry.
+        assert_eq!(hit_test(&app, cols, rows, 60, 3), Hit::Preview);
+        assert_eq!(hit_test(&app, cols, rows, 3, 1), Hit::Parent(0));
+        assert_eq!(hit_test(&app, cols, rows, 3, 2), Hit::Nothing, "past end of parent");
+
+        // Scrolling shifts which entry a given cell refers to — the same offset
+        // the renderer uses, so clicks track what the user sees.
+        app.move_cursor(50);
+        let offset = scroll_begin(50, 100, rows - 2);
+        assert!(offset > 0, "list is scrolled");
+        assert_eq!(hit_test(&app, cols, rows, 20, 1), Hit::Current(offset));
+        assert_eq!(hit_test(&app, cols, rows, 20, 4), Hit::Current(offset + 3));
+
+        // A terminal too small to draw has no targets.
+        assert_eq!(hit_test(&app, 2, 2, 0, 0), Hit::Nothing);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

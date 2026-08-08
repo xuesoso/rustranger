@@ -53,7 +53,7 @@ is opt-in through a configured external renderer — see below.)
 | `gg` / `G` | top / bottom | `V` | toggle all marks |
 | `Ctrl-d`/`Ctrl-u` | half-page down/up | `uv` | clear marks |
 | `J`/`K` | scroll preview | `yy` | copy |
-| `zh` / `zi` | toggle hidden / image preview | `dd` | cut |
+| `zh` / `zi` / `zm` | toggle hidden / image preview / mouse | `dd` | cut |
 | `yn` / `yb` | copy name / base name (no ext) to clipboard | | |
 | `gh` / `g/` | home / root dir | `pp` | paste |
 | `H` / `L` | history back / forward | `pl` / `pL` | paste symlink (rel/abs) |
@@ -69,6 +69,13 @@ is opt-in through a configured external renderer — see below.)
 Pressing a multi-key prefix (`o`, `g`, `d`, `y`, `p`, `u`, `c`, `z`, `m`, `` ` ``) pops
 up a hint menu listing the keys that complete it — like ranger's keychain hints.
 Press `?` for a full scrollable list of every binding.
+
+**Mouse** — on by default (`mouse_enabled`, toggle with `zm`). The wheel scrolls
+the file list, or the preview when the pointer is over the preview pane; **left
+click** selects and enters/opens (like `l`), and in the parent column jumps to that
+directory; **right click** goes up to the parent (like `h`). While mouse reporting
+is on, use your terminal's usual override (Shift, or Option/Alt on macOS) to select
+text with the mouse — or turn it off with `zm`.
 
 **Sort** — press `o` to open the sort menu, then a key. **Lowercase sorts
 ascending, the SHIFTed uppercase key sorts descending** (ranger's convention):

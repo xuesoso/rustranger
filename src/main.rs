@@ -191,9 +191,27 @@ fn setup_terminal() -> io::Result<()> {
 
 fn restore_terminal() -> io::Result<()> {
     let mut out = io::stdout();
+    // Stop mouse reporting first: leaving it on would make the shell we return to
+    // (or a panic'd exit) spew escape sequences on every click.
+    out.write_all(MOUSE_OFF.as_bytes())?;
     execute!(out, crossterm::terminal::EnableLineWrap, cursor::Show, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     Ok(())
+}
+
+/// Mouse reporting: button press/release (mode 1000) with SGR extended coordinates
+/// (mode 1006, which lifts the 223-column limit so clicks land correctly on wide
+/// terminals).
+///
+/// Deliberately *not* crossterm's `EnableMouseCapture`, which also turns on
+/// any-event tracking (mode 1003): that reports every pointer *motion*, waking the
+/// run loop — and its per-frame directory re-stat — for events we never use.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+
+fn set_mouse(out: &mut impl Write, on: bool) -> io::Result<()> {
+    out.write_all(if on { MOUSE_ON } else { MOUSE_OFF }.as_bytes())?;
+    out.flush()
 }
 
 fn run(app: &mut App) -> io::Result<()> {
@@ -215,7 +233,15 @@ fn run(app: &mut App) -> io::Result<()> {
     let mut needs_full = false;
     // In-pane image/document preview (kitty/sixel graphics over the preview box).
     let mut img = rustranger::imgpreview::ImagePreview::new();
+    // Whether the terminal is currently reporting mouse events. Re-synced against
+    // the setting every frame, so `zm` takes effect immediately and an external
+    // program that clobbered the mode gets it restored.
+    let mut mouse_on = false;
     while !app.quit && !TERMINATE.load(Ordering::Relaxed) {
+        if mouse_on != app.settings.mouse_enabled {
+            set_mouse(&mut out, app.settings.mouse_enabled)?;
+            mouse_on = app.settings.mouse_enabled;
+        }
         app.prepare_view();
         if let Ok((cols, rows)) = crossterm::terminal::size() {
             let (cols, rows) = (cols as usize, rows as usize);
@@ -297,13 +323,14 @@ fn run(app: &mut App) -> io::Result<()> {
         };
         let have_event = event::poll(std::time::Duration::from_millis(idle_ms))?;
         if have_event {
-            handle_event(app, event::read()?, &mut pending, &mut count);
+            let size = (cur.cols, cur.rows);
+            handle_event(app, event::read()?, &mut pending, &mut count, size);
             // Coalesce a burst: handle every event already queued before the next
             // redraw, so fast key-repeat (which backs up behind a slow tmux/SSH
             // redraw) collapses into ONE frame instead of one frame per key. This
             // self-paces rendering to whatever the display can keep up with.
             while event::poll(std::time::Duration::ZERO)? {
-                handle_event(app, event::read()?, &mut pending, &mut count);
+                handle_event(app, event::read()?, &mut pending, &mut count, size);
                 // Don't keep swallowing keys once a key has asked to launch an
                 // external program or quit (those keys belong to the next state).
                 if app.pending_run.is_some() || app.quit {
@@ -320,6 +347,13 @@ fn run(app: &mut App) -> io::Result<()> {
         if let Some(req) = app.pending_run.take() {
             // Remove any preview image so it doesn't linger over the child program.
             let _ = img.clear(&mut out);
+            // Hand the mouse back to the child (and to the terminal's own
+            // selection). Clearing the flag re-arms the sync at the top of the
+            // loop, which restores our mode once the child is gone.
+            if mouse_on {
+                let _ = set_mouse(&mut out, false);
+                mouse_on = false;
+            }
             let bg = app.settings.theme.bg;
             let (suspended, error) = run_external(&mut out, req, bg)?;
             if suspended {
@@ -338,14 +372,106 @@ fn run(app: &mut App) -> io::Result<()> {
     Ok(())
 }
 
-/// Dispatch a single terminal event (ignores key releases and non-key events;
+/// Dispatch a single terminal event (ignores key releases and unhandled events;
 /// resize is handled implicitly since the loop re-queries the size each frame).
-fn handle_event(app: &mut App, ev: Event, pending: &mut Option<char>, count: &mut Option<usize>) {
-    if let Event::Key(key) = ev {
-        if key.kind != KeyEventKind::Release {
-            handle_key(app, key, pending, count);
-        }
+/// `size` is the last rendered `(cols, rows)`, needed to hit-test mouse clicks.
+fn handle_event(
+    app: &mut App,
+    ev: Event,
+    pending: &mut Option<char>,
+    count: &mut Option<usize>,
+    size: (usize, usize),
+) {
+    match ev {
+        Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key, pending, count),
+        Event::Mouse(me) => handle_mouse(app, me, pending, count, size),
+        _ => {}
     }
+}
+
+/// Rows the wheel moves per notch — the usual desktop convention, and the same
+/// step `J`/`K` use for the preview pane.
+const WHEEL_ROWS: isize = 3;
+
+/// Dispatch a mouse event: the wheel scrolls, left click selects-and-enters (like
+/// `l`), right click goes to the parent (like `h`). Only ever called while mouse
+/// reporting is on, since the terminal reports nothing otherwise.
+fn handle_mouse(
+    app: &mut App,
+    me: crossterm::event::MouseEvent,
+    pending: &mut Option<char>,
+    count: &mut Option<usize>,
+    (cols, rows): (usize, usize),
+) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    // A y/n confirmation and the console own every input: a stray click must never
+    // answer a delete prompt or disturb a half-typed command.
+    if app.confirm.is_some() || app.console.is_some() {
+        return;
+    }
+
+    // The help overlay scrolls with the wheel; clicks do nothing.
+    if let Some(scroll) = app.help {
+        let step = WHEEL_ROWS as usize;
+        match me.kind {
+            MouseEventKind::ScrollUp => app.help = Some(scroll.saturating_sub(step)),
+            MouseEventKind::ScrollDown => {
+                app.help = Some((scroll + step).min(ui::help_len().saturating_sub(1)))
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // A key-chain menu is a hint awaiting its second key. A click dismisses it
+    // (like Esc) and is otherwise swallowed — clearing the pending prefix too, so
+    // it can't silently consume the next keystroke.
+    if app.menu.is_some() {
+        if matches!(me.kind, MouseEventKind::Down(_)) {
+            app.menu = None;
+            *pending = None;
+            *count = None;
+        }
+        return;
+    }
+
+    match me.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let delta = if matches!(me.kind, MouseEventKind::ScrollDown) {
+                WHEEL_ROWS
+            } else {
+                -WHEEL_ROWS
+            };
+            // Over the preview pane the wheel scrolls the preview (like J/K);
+            // anywhere else it moves the cursor through the listing.
+            if matches!(ui::hit_test(app, cols, rows, me.column, me.row), ui::Hit::Preview) {
+                app.scroll_preview(delta);
+            } else {
+                app.move_cursor(delta);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.message = None;
+            match ui::hit_test(app, cols, rows, me.column, me.row) {
+                // Select what was clicked, then act on it — enter a directory or
+                // open a file, exactly as `l` / Enter would.
+                ui::Hit::Current(i) => {
+                    app.select_index(i);
+                    app.enter();
+                }
+                // In the parent column a click means "go to that directory".
+                ui::Hit::Parent(i) => app.enter_parent_entry(i),
+                ui::Hit::Preview | ui::Hit::Nothing => {}
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            app.message = None;
+            app.ascend();
+        }
+        _ => {} // middle click, button release, motion: nothing to do
+    }
+    *count = None; // a click ends any numeric prefix
 }
 
 /// Run an external program. Blocking programs (editors/pager/shell) suspend the
@@ -553,6 +679,7 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
                 'z' => match c {
                     'h' => app.toggle_hidden(),
                     'i' => app.toggle_preview_images(),
+                    'm' => app.toggle_mouse(),
                     _ => {}
                 },
                 'd' => {
