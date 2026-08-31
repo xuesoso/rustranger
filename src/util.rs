@@ -109,26 +109,53 @@ pub fn permission_string(mode: u32) -> String {
     chars.into_iter().collect()
 }
 
+/// Memo for the id->name lookups below.
+///
+/// `getpwuid`/`getgrgid` re-open and re-read `/etc/passwd` / `/etc/group` on
+/// every call (there is no libc-side cache without nscd), which the status bar
+/// was paying for on *every frame* — a dozen syscalls per repaint to answer a
+/// question whose answer never changes during a session. A directory rarely
+/// holds more than a handful of distinct owners, so a plain map is the whole
+/// fix; entries are never invalidated, which is the same staleness window the
+/// listing itself has.
+type IdCache = std::sync::Mutex<std::collections::HashMap<u32, String>>;
+
+fn cached(cache: &'static std::sync::OnceLock<IdCache>, id: u32, look_up: impl Fn(u32) -> String) -> String {
+    let map = cache.get_or_init(Default::default);
+    if let Ok(m) = map.lock() {
+        if let Some(name) = m.get(&id) {
+            return name.clone();
+        }
+    }
+    let name = look_up(id);
+    if let Ok(mut m) = map.lock() {
+        m.insert(id, name.clone());
+    }
+    name
+}
+
 /// Look up a username for a uid via libc getpwuid; falls back to the numeric id.
 pub fn username(uid: u32) -> String {
-    unsafe {
+    static CACHE: std::sync::OnceLock<IdCache> = std::sync::OnceLock::new();
+    cached(&CACHE, uid, |uid| unsafe {
         let pw = libc::getpwuid(uid);
         if pw.is_null() {
             return uid.to_string();
         }
         cstr_to_string((*pw).pw_name).unwrap_or_else(|| uid.to_string())
-    }
+    })
 }
 
 /// Look up a group name for a gid via libc getgrgid; falls back to the numeric id.
 pub fn groupname(gid: u32) -> String {
-    unsafe {
+    static CACHE: std::sync::OnceLock<IdCache> = std::sync::OnceLock::new();
+    cached(&CACHE, gid, |gid| unsafe {
         let gr = libc::getgrgid(gid);
         if gr.is_null() {
             return gid.to_string();
         }
         cstr_to_string((*gr).gr_name).unwrap_or_else(|| gid.to_string())
-    }
+    })
 }
 
 unsafe fn cstr_to_string(ptr: *const libc::c_char) -> Option<String> {

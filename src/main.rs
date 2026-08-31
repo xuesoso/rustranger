@@ -8,7 +8,7 @@ use crossterm::{cursor, execute};
 
 // Modules live in the library crate (src/lib.rs); the binary just drives them.
 use rustranger::app::{self, App};
-use rustranger::{config, fs, open, ui};
+use rustranger::{config, fs, open, tty, ui};
 
 /// Internal pending-key sentinel for the `um{key}` chord (awaiting the bookmark
 /// key to delete). Not a typeable key, so it never collides with a real prefix.
@@ -19,6 +19,11 @@ const UNBOOKMARK_PENDING: char = '\u{1}';
 /// the normal path — restoring raw mode and the alternate screen — instead of
 /// leaving the shell on a raw, drawn-over screen.
 static TERMINATE: AtomicBool = AtomicBool::new(false);
+
+/// How long the hangup watchdog lets the run loop shut down cleanly before it
+/// exits the process itself. Generous next to the 500 ms idle poll, but far
+/// short of "burns a core until the user notices".
+const HANGUP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 extern "C" fn on_terminate(_sig: libc::c_int) {
     // A relaxed atomic store is async-signal-safe; everything else happens on
@@ -151,6 +156,12 @@ fn main() -> io::Result<()> {
     }
 
     setup_terminal()?;
+    // The terminal can vanish under us: window closed, emulator quit, ssh
+    // dropped. The SIGHUP that comes with it is caught above rather than fatal,
+    // so noticing the hangup is on us. Watch for it directly; the run loop then
+    // leaves through the normal path, and the watchdog force-exits if it can't
+    // (see `tty`), so we never leave a detached CPU-spinning orphan.
+    tty::watch_hangup(HANGUP_GRACE, || TERMINATE.store(true, Ordering::Relaxed));
     // Restore the terminal even if we panic mid-render.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -237,13 +248,29 @@ fn run(app: &mut App) -> io::Result<()> {
     // the setting every frame, so `zm` takes effect immediately and an external
     // program that clobbered the mode gets it restored.
     let mut mouse_on = false;
+    // Cursor state as the terminal last saw it, so an unchanged frame can skip
+    // its write. `None` until the first frame, which therefore always writes.
+    let mut last_cursor: Option<Option<(u16, u16)>> = None;
+    // Take over SIGWINCH for our own wait (see `tty::install_resize_wake`). The
+    // priming poll builds crossterm's event source — and registers its handler —
+    // first, so ours is the one that survives.
+    let _ = event::poll(std::time::Duration::ZERO);
+    tty::install_resize_wake();
+    // Whether crossterm may still be holding parsed-but-unread events. Normally
+    // the coalescing loop below drains it dry, so the loop can go straight to
+    // sleeping on the fd; it only breaks out early when a key asked to launch a
+    // program or quit, and that is the one case worth an extra poll for.
+    let mut maybe_buffered = false;
     while !app.quit && !TERMINATE.load(Ordering::Relaxed) {
         if mouse_on != app.settings.mouse_enabled {
             set_mouse(&mut out, app.settings.mouse_enabled)?;
             mouse_on = app.settings.mouse_enabled;
         }
         app.prepare_view();
-        if let Ok((cols, rows)) = crossterm::terminal::size() {
+        // Our own ioctl on the fd we already hold; crossterm's `size()` reopens
+        // /dev/tty every call. Falls back to it when there is no terminal fd.
+        let size = tty::size().or_else(|| crossterm::terminal::size().ok());
+        if let Some((cols, rows)) = size {
             let (cols, rows) = (cols as usize, rows as usize);
             if cur.cols != cols || cur.rows != rows {
                 cur = Buffer::new(cols, rows, default);
@@ -269,7 +296,7 @@ fn run(app: &mut App) -> io::Result<()> {
             }
             let cursor = ui::render(&mut cur, app);
             frame.clear();
-            screen::flush(&mut frame, prev.as_ref(), &cur)?;
+            let cells_changed = screen::flush(&mut frame, prev.as_ref(), &cur)?;
             // Cursor: shown at the console edit position, hidden otherwise.
             match cursor {
                 Some((cx, cy)) => {
@@ -277,8 +304,15 @@ fn run(app: &mut App) -> io::Result<()> {
                 }
                 None => crossterm::queue!(frame, crossterm::cursor::Hide)?,
             }
-            out.write_all(&frame)?;
-            out.flush()?;
+            // An idle tick usually changes nothing. Writing the frame anyway
+            // means a syscall and a synchronized-update wrapper down the wire
+            // twice a second forever — noise on an ssh or tmux link, and a
+            // wake-up for the terminal, to redraw a screen that is identical.
+            if cells_changed || last_cursor != Some(cursor) {
+                out.write_all(&frame)?;
+                out.flush()?;
+                last_cursor = Some(cursor);
+            }
             // Paint (or clear) the in-pane image preview over the just-flushed
             // cells. A sixel clear needs its pixels painted over, so it asks for a
             // full repaint next frame.
@@ -321,7 +355,24 @@ fn run(app: &mut App) -> io::Result<()> {
         } else {
             500
         };
-        let have_event = event::poll(std::time::Duration::from_millis(idle_ms))?;
+        // Wait for input ourselves rather than blocking inside crossterm, whose
+        // event source spins forever on a hung-up terminal (see `tty`). Anything
+        // crossterm still has parsed comes out first; otherwise sleep on the fd.
+        let mut have_event =
+            maybe_buffered && !tty::hung_up() && event::poll(std::time::Duration::ZERO)?;
+        maybe_buffered = false;
+        if !have_event {
+            match tty::wait(std::time::Duration::from_millis(idle_ms)) {
+                // The terminal is gone: leave through the normal shutdown path
+                // instead of handing crossterm an fd it will spin on.
+                tty::Wait::Hangup => break,
+                // Input is waiting on a live fd, so crossterm can read it.
+                tty::Wait::Ready => have_event = event::poll(std::time::Duration::ZERO)?,
+                // A resize just needs the loop to turn: it re-reads the size and
+                // repaints at the top. A timeout is the idle tick.
+                tty::Wait::Resized | tty::Wait::Timeout => {}
+            }
+        }
         if have_event {
             let size = (cur.cols, cur.rows);
             handle_event(app, event::read()?, &mut pending, &mut count, size);
@@ -329,11 +380,12 @@ fn run(app: &mut App) -> io::Result<()> {
             // redraw, so fast key-repeat (which backs up behind a slow tmux/SSH
             // redraw) collapses into ONE frame instead of one frame per key. This
             // self-paces rendering to whatever the display can keep up with.
-            while event::poll(std::time::Duration::ZERO)? {
+            while !tty::hung_up() && event::poll(std::time::Duration::ZERO)? {
                 handle_event(app, event::read()?, &mut pending, &mut count, size);
                 // Don't keep swallowing keys once a key has asked to launch an
                 // external program or quit (those keys belong to the next state).
                 if app.pending_run.is_some() || app.quit {
+                    maybe_buffered = true; // and they may already be parsed
                     break;
                 }
             }

@@ -25,5 +25,6 @@ pub mod screen;
 pub mod state;
 pub mod tab;
 pub mod theme;
+pub mod tty;
 pub mod ui;
 pub mod util;

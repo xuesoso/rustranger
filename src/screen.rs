@@ -152,12 +152,18 @@ pub fn clear(out: &mut impl Write, style: Style) -> io::Result<()> {
 /// Emit the minimal escape sequences to turn the displayed `prev` frame into
 /// `cur`. With no `prev` (or a size change) every cell is (re)drawn. Wrapped in
 /// synchronized-update markers for terminals that honor them.
-pub fn flush(out: &mut impl Write, prev: Option<&Buffer>, cur: &Buffer) -> io::Result<()> {
+/// Returns whether any cell actually changed. An unchanged frame still queues a
+/// synchronized-update wrapper and a colour reset, and writing those costs a
+/// syscall and a couple of dozen bytes down the wire — twice a second forever,
+/// and over ssh or tmux that is real traffic for a screen nobody redrew. The
+/// caller uses this to skip the write entirely.
+pub fn flush(out: &mut impl Write, prev: Option<&Buffer>, cur: &Buffer) -> io::Result<bool> {
     queue!(out, BeginSynchronizedUpdate)?;
     let same_size = prev
         .map(|p| p.cols == cur.cols && p.rows == cur.rows)
         .unwrap_or(false);
     let mut active: Option<Style> = None;
+    let mut any_changed = false;
     // Where the terminal cursor sits in our model, so contiguous runs of changed
     // cells avoid a redundant MoveTo before every character.
     let mut pen: Option<(usize, usize)> = None;
@@ -183,12 +189,13 @@ pub fn flush(out: &mut impl Write, prev: Option<&Buffer>, cur: &Buffer) -> io::R
                 }
                 queue!(out, Print(cell.ch))?;
                 pen = Some((x + w, y));
+                any_changed = true;
             }
             x += w;
         }
     }
     queue!(out, ResetColor, EndSynchronizedUpdate)?;
-    Ok(())
+    Ok(any_changed)
 }
 
 fn emit_style(out: &mut impl Write, s: Style) -> io::Result<()> {

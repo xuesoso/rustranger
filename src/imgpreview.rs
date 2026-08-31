@@ -15,8 +15,10 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,6 +32,47 @@ const KITTY_IMAGE_ID: u32 = 0x0070_6466;
 /// How long the selection must rest on a file before its preview starts, so fast
 /// scrolling through a directory of images doesn't spawn a renderer per file.
 const DEBOUNCE: Duration = Duration::from_millis(90);
+
+/// Give up on a renderer that hasn't finished in this long and kill it. A
+/// renderer that never returns would otherwise pin the run loop to its 50 ms
+/// "a preview is coming" tick forever (10x the idle wake-up rate, for good), and
+/// go on burning CPU as an orphan once rustranger exits.
+const RENDER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long to sit in `poll(2)` between checks of the cancel flag while a
+/// renderer is running. Short enough that navigating away kills the renderer
+/// promptly, long enough to cost nothing.
+const POLL_SLICE_MS: libc::c_int = 50;
+
+/// How long a cached answer from the tmux server stays good. The cache is also
+/// dropped outright on a resize (see [`ImagePreview::forget`]), which is what a
+/// client attaching, detaching, or re-attaching from a different terminal
+/// normally causes; this bounds the case where it doesn't.
+const TMUX_TTL: Duration = Duration::from_secs(5);
+
+/// How long to wait before looking again after skipping a render because no tmux
+/// client was attached. Attaching usually resizes the pane and clears everything,
+/// but a client that happens to match the session's existing size doesn't — so
+/// re-check occasionally rather than waiting for the next keystroke.
+const DETACHED_RETRY: Duration = Duration::from_secs(2);
+
+/// Ceiling on a `tmux display-message` round-trip. It normally answers in ~3 ms;
+/// this runs on the UI thread, so a server that is wedged, paused, or gone must
+/// cost us a hitch rather than the session.
+const TMUX_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// After killing a renderer, how long to keep reading before giving up on its
+/// pipes reaching EOF. A killed process closes them at once, but if it left
+/// children of its own holding the write end (a shell wrapper that didn't
+/// `exec`), waiting for EOF would mean waiting for *them* — the very hang we are
+/// trying to escape.
+const KILL_GRACE: Duration = Duration::from_millis(250);
+
+/// How long shutdown waits for an abandoned renderer to actually die. Cancelling
+/// only *asks* the render thread to kill its child, and a process that exits the
+/// moment after has no threads left to do the asking — so the last one out waits
+/// for the acknowledgement rather than leaving an orphan behind.
+const SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
 
 pub type Rect = (u16, u16, u16, u16); // (x, top, cols, rows) in cells
 
@@ -71,6 +114,22 @@ struct Shown {
     bg: crossterm::style::Color,
 }
 
+/// Cancels the render it belongs to when dropped.
+///
+/// Dropping an [`Inflight`] is how rustranger says "I no longer want this
+/// picture" — the selection moved on, an overlay opened, the screen was wiped,
+/// or we're quitting. Without this the renderer would keep running unwatched:
+/// on quit it outlives us entirely, reparented to init, still rasterizing a page
+/// nobody will ever see. `Inflight` itself deliberately has no `Drop` impl, so
+/// its other fields can still be moved out; this field runs regardless.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// A render running on a background thread; its result arrives over `rx`.
 struct Inflight {
     path: PathBuf,
@@ -79,6 +138,9 @@ struct Inflight {
     tmux: bool,
     bg: crossterm::style::Color,
     rx: Receiver<Result<Vec<u8>, String>>,
+    /// Dropped when this render is abandoned or superseded, which kills the
+    /// renderer process (see [`CancelOnDrop`]).
+    _cancel: CancelOnDrop,
 }
 
 #[derive(Default)]
@@ -92,6 +154,27 @@ pub struct ImagePreview {
     /// respawn loop when the renderer fails or emits nothing (e.g. not installed):
     /// each target is tried once until the selection or geometry changes.
     attempted: Option<(PathBuf, Rect)>,
+    /// When a render was last skipped for want of an attached tmux client, so the
+    /// skip can lapse instead of lasting until the next keypress.
+    detached_at: Option<Instant>,
+}
+
+/// Kill any renderer still running when the preview manager goes away — that is,
+/// when rustranger is quitting. Dropping the [`Inflight`] alone only sets the
+/// cancel flag; the render thread that acts on it dies with the process, so
+/// without this wait a `folio` rasterizing a large page would be left running,
+/// reparented to init, invisible and burning a core until noticed by hand.
+impl Drop for ImagePreview {
+    fn drop(&mut self) {
+        let Some(inf) = self.inflight.take() else {
+            return;
+        };
+        inf._cancel.0.store(true, Ordering::Relaxed);
+        // The render thread only reports back once it has killed and reaped the
+        // renderer, so this returning means the child is gone. On timeout we quit
+        // anyway: a dying pipe will finish the job for any renderer that writes.
+        let _ = inf.rx.recv_timeout(SHUTDOWN_WAIT);
+    }
 }
 
 impl ImagePreview {
@@ -113,6 +196,11 @@ impl ImagePreview {
         self.pending = None;
         self.inflight = None; // drop the receiver; the thread finishes, ignored
         self.attempted = None;
+        self.detached_at = None;
+        // A resize is the one event that reliably accompanies a tmux client
+        // attaching, detaching, or re-attaching from a different terminal — and
+        // each of those changes the protocol and cell size we render for.
+        invalidate_tmux_client();
     }
 
     /// Reconcile the displayed image with the current selection, non-blocking.
@@ -184,6 +272,12 @@ impl ImagePreview {
                 if self.inflight.as_ref().is_some_and(|i| i.path == path && i.rect == rect) {
                     self.pending = None;
                     return Ok(res);
+                }
+                // A render skipped for want of a tmux client gets another look
+                // once in a while; see DETACHED_RETRY.
+                if self.detached_at.is_some_and(|t| t.elapsed() >= DETACHED_RETRY) {
+                    self.detached_at = None;
+                    self.attempted = None;
                 }
                 // Already tried this exact target and it produced nothing (failed
                 // or renderer missing) — don't spin retrying it every tick.
@@ -259,15 +353,30 @@ impl ImagePreview {
         let Some(tmpl) = app.preview_command_for(&path).map(str::to_string) else {
             return;
         };
+        // Inside tmux with no client attached there is nobody to show the image
+        // to — and no client to measure, so the cell size would be a guess and
+        // the page would rasterize at the wrong resolution anyway. Skip it, and
+        // note the skip so it can lapse (attaching normally resizes the pane,
+        // which clears this outright).
+        if in_tmux() && !tmux_client().attached {
+            self.attempted = Some((path, rect));
+            self.detached_at = Some(Instant::now());
+            return;
+        }
         let proto = resolve_protocol(app.settings.preview_protocol);
         let (cell_w, cell_h) = cell_pixel_size();
         let tmux = in_tmux();
         let bg = theme_bg_hex(app);
         let (tx, rx) = mpsc::channel();
         let p = path.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
         thread::spawn(move || {
-            let _ = tx.send(run_renderer(&tmpl, &p, rect, proto, cell_w, cell_h, tmux, &bg));
+            let _ = tx.send(run_renderer(&tmpl, &p, rect, proto, cell_w, cell_h, tmux, &bg, &flag));
         });
+        // Assigning replaces any previous Inflight, whose CancelOnDrop stops the
+        // render it stood for — so a burst of navigation leaves one renderer
+        // running, not one per file passed through.
         self.inflight = Some(Inflight {
             path,
             rect,
@@ -275,6 +384,7 @@ impl ImagePreview {
             tmux,
             bg: app.settings.theme.bg,
             rx,
+            _cancel: CancelOnDrop(cancel),
         });
     }
 }
@@ -290,6 +400,7 @@ fn run_renderer(
     cell_h: u16,
     tmux: bool,
     bg: &str,
+    cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     let (x, y, c, r) = rect;
     let path_str = path.to_string_lossy();
@@ -324,8 +435,28 @@ fn run_renderer(
         }
     };
     log(&format!("run: {argv:?}"));
-    let output = match Command::new(prog).args(args).output() {
-        Ok(o) => o,
+    // stdin is closed: a renderer must never read the keystrokes meant for us.
+    let mut cmd = Command::new(prog);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Give the renderer a process group of its own, so cancelling it takes any
+    // helpers it spawned with it (a `[preview]` command may well be a shell
+    // wrapper) instead of orphaning them. It also keeps terminal signals meant
+    // for the foreground app from reaching a background helper.
+    // SAFETY: the closure runs between fork and exec and calls only setpgid,
+    // which is async-signal-safe.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let spawned = cmd.spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
         // Renderer isn't installed / not on PATH: skip the preview silently rather
         // than spamming the status bar on every image (the default config ships a
         // `folio` command that not everyone has).
@@ -338,17 +469,149 @@ fn run_renderer(
             return Err(format!("{prog}: {e}"));
         }
     };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        log(&format!("  -> exit {:?}, stderr: {}", output.status.code(), stderr.trim()));
+    let collected = collect(&mut child, cancel, RENDER_TIMEOUT);
+    let (stdout, stderr, status) = match collected {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            log(&format!("  -> read error: {e}"));
+            return Err(format!("{prog}: {e}"));
+        }
+    };
+    if let Outcome::Cancelled = status {
+        // We asked for this: the selection moved on, or we're shutting down.
+        log("  -> abandoned; renderer killed");
+        return Ok(Vec::new());
+    }
+    if let Outcome::TimedOut = status {
+        let secs = RENDER_TIMEOUT.as_secs();
+        log(&format!("  -> timed out after {secs}s; renderer killed"));
+        return Err(format!("{prog}: no output after {secs}s"));
+    }
+    let Outcome::Exited(exit) = status else { unreachable!() };
+    if !exit.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        log(&format!("  -> exit {:?}, stderr: {}", exit.code(), stderr.trim()));
         return Err(stderr
             .lines()
             .find(|l| !l.trim().is_empty())
             .unwrap_or("renderer failed")
             .to_string());
     }
-    log(&format!("  -> ok, {} bytes of escapes", output.stdout.len()));
-    Ok(output.stdout)
+    log(&format!("  -> ok, {} bytes of escapes", stdout.len()));
+    Ok(stdout)
+}
+
+/// How a renderer run ended.
+enum Outcome {
+    Exited(std::process::ExitStatus),
+    /// Abandoned mid-render (the cancel flag was set) and killed.
+    Cancelled,
+    /// Still running at [`RENDER_TIMEOUT`] and killed.
+    TimedOut,
+}
+
+/// Run `child` to completion, collecting stdout and stderr — but kill it if
+/// `cancel` is set or `timeout` elapses first, rather than letting a renderer we
+/// no longer care about run on unsupervised.
+///
+/// Both pipes are drained as they fill. That is not optional: a full-page sixel
+/// is comfortably larger than a pipe buffer, so a renderer whose stdout nobody
+/// reads simply blocks forever — the deadlock `Command::output` exists to avoid,
+/// and which we have to reproduce by hand now that we also want to interrupt it.
+fn collect(
+    child: &mut Child,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> io::Result<(Vec<u8>, Vec<u8>, Outcome)> {
+    use std::os::fd::AsRawFd;
+
+    let (out_pipe, err_pipe) = (child.stdout.take(), child.stderr.take());
+    let mut fd_out = out_pipe.as_ref().map_or(-1, |p| p.as_raw_fd());
+    let mut fd_err = err_pipe.as_ref().map_or(-1, |p| p.as_raw_fd());
+    for fd in [fd_out, fd_err] {
+        // SAFETY: fd is a live pipe fd owned by `child` for this scope.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+    }
+
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut buf = [0u8; 16 * 1024];
+    let start = Instant::now();
+    let mut killed: Option<Outcome> = None;
+    let mut give_up_at: Option<Instant> = None;
+
+    while fd_out >= 0 || fd_err >= 0 {
+        if killed.is_none() {
+            let reason = if cancel.load(Ordering::Relaxed) {
+                Some(Outcome::Cancelled)
+            } else if start.elapsed() >= timeout {
+                Some(Outcome::TimedOut)
+            } else {
+                None
+            };
+            if let Some(r) = reason {
+                // The whole group: the renderer and anything it started.
+                // SAFETY: kill(2) with a negative pid signals that process
+                // group; the child is unreaped, so its pid is still ours.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                let _ = child.kill(); // in case it never got its own group
+                killed = Some(r);
+                give_up_at = Some(Instant::now() + KILL_GRACE);
+            }
+        }
+        if give_up_at.is_some_and(|t| Instant::now() >= t) {
+            break; // stop waiting on pipes something else may still hold open
+        }
+        let mut pfds = [
+            libc::pollfd { fd: fd_out, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: fd_err, events: libc::POLLIN, revents: 0 },
+        ];
+        // A negative fd makes poll skip that entry, which is how a pipe that has
+        // already reached EOF drops out of the wait.
+        // SAFETY: pfds holds two valid, initialised pollfds.
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, POLL_SLICE_MS) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        for (i, (fd, sink)) in [(&mut fd_out, &mut out), (&mut fd_err, &mut err)]
+            .into_iter()
+            .enumerate()
+        {
+            // Any revent (POLLIN, but also POLLHUP/POLLERR) means "read it and
+            // find out"; a hung-up pipe simply reads as EOF.
+            if *fd < 0 || pfds[i].revents == 0 {
+                continue;
+            }
+            loop {
+                // SAFETY: buf is a valid writable buffer of buf.len() bytes.
+                let n = unsafe { libc::read(*fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n > 0 {
+                    sink.extend_from_slice(&buf[..n as usize]);
+                    continue;
+                }
+                if n == 0 {
+                    *fd = -1; // EOF: this pipe is done
+                    break;
+                }
+                match io::Error::last_os_error().kind() {
+                    io::ErrorKind::WouldBlock => break,
+                    io::ErrorKind::Interrupted => continue,
+                    _ => {
+                        *fd = -1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    drop((out_pipe, err_pipe));
+    let exit = child.wait()?;
+    Ok((out, err, killed.unwrap_or(Outcome::Exited(exit))))
 }
 
 /// Resolve the configured protocol to the string passed to the renderer (`%p`).
@@ -367,7 +630,7 @@ fn resolve_protocol(p: PreviewProtocol) -> &'static str {
                 // 1337 (its kitty support lacks placeholders); everything else —
                 // including iTerm2 — goes through tmux's native sixel, which is
                 // the path tmux itself keeps consistent for such clients.
-                match tmux_client_term().as_deref() {
+                match tmux_client().term.as_deref() {
                     Some(t) if t.contains("ghostty") || t.contains("kitty") => "kitty",
                     Some(t) if t.contains("wezterm") => "iterm",
                     _ => "sixel",
@@ -428,43 +691,123 @@ fn iterm_capable() -> bool {
         || matches!(std::env::var("LC_TERMINAL").ok().as_deref(), Some("iTerm2"))
 }
 
+/// Run a short helper command and return its stdout, or `None` if it failed or
+/// overran `timeout`. Uses the same bounded, own-process-group machinery as the
+/// renderer: this runs on the UI thread, so it must not be able to hang there,
+/// and it must not leave a child behind if it does.
+fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // SAFETY: the closure runs between fork and exec and calls only setpgid,
+    // which is async-signal-safe.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().ok()?;
+    let (out, _, outcome) = collect(&mut child, &AtomicBool::new(false), timeout).ok()?;
+    matches!(outcome, Outcome::Exited(s) if s.success()).then_some(out)
+}
+
 fn in_tmux() -> bool {
     std::env::var_os("TMUX").is_some()
 }
 
-/// Ask tmux for a format expansion, targeted at OUR pane's session so the answer
-/// reflects the client actually viewing this pane (a server can have several
-/// sessions/clients attached from different terminals).
-fn tmux_display(fmt: &str) -> Option<String> {
+/// What the tmux server says about the client currently viewing our pane.
+///
+/// Everything here is a property of the *client*, not the pane: a session can be
+/// attached from several terminals, or from none, and re-attaching from a
+/// different emulator changes all of it. Pane environment variables are stale by
+/// construction (the server keeps the env of wherever it was started), so the
+/// server is the only honest source.
+#[derive(Clone, Default)]
+struct TmuxClient {
+    /// Whether anyone is attached at all. Nothing rendered while this is false
+    /// can be seen by anybody.
+    attached: bool,
+    /// TERM of the attached client (lowercased), e.g. "xterm-ghostty".
+    term: Option<String>,
+    /// The client's cell size in pixels.
+    cell: Option<(u16, u16)>,
+}
+
+/// Cached [`TmuxClient`], with the time it was fetched.
+static TMUX_CLIENT: std::sync::Mutex<Option<(Instant, TmuxClient)>> = std::sync::Mutex::new(None);
+
+/// Drop the cached answer, so the next question goes to the server.
+fn invalidate_tmux_client() {
+    if let Ok(mut g) = TMUX_CLIENT.lock() {
+        *g = None;
+    }
+}
+
+/// The attached client's properties, from cache when it is fresh.
+///
+/// Every miss is a `tmux display-message` round trip: a fork, an exec, and a
+/// wait on the socket, about 3 ms — on the UI thread. Asking twice per preview
+/// (once for the protocol, once for the cell size) made every image cost ~6 ms
+/// of stall before the renderer even started; one combined query, cached, makes
+/// that nearly always free.
+fn tmux_client() -> TmuxClient {
+    if let Ok(g) = TMUX_CLIENT.lock() {
+        if let Some((at, facts)) = g.as_ref() {
+            if at.elapsed() < TMUX_TTL {
+                return facts.clone();
+            }
+        }
+    }
+    let facts = probe_tmux_client();
+    if let Ok(mut g) = TMUX_CLIENT.lock() {
+        *g = Some((Instant::now(), facts.clone()));
+    }
+    facts
+}
+
+/// One round trip for everything we need. Targeted at OUR pane's session, so the
+/// answer describes the client actually viewing this pane.
+fn probe_tmux_client() -> TmuxClient {
+    const FMT: &str =
+        "#{session_attached}|#{client_termname}|#{client_cell_width}|#{client_cell_height}";
     let mut cmd = Command::new("tmux");
     cmd.arg("display-message");
     if let Some(pane) = std::env::var_os("TMUX_PANE") {
         cmd.arg("-t").arg(pane);
     }
-    let out = cmd.args(["-p", fmt]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    cmd.args(["-p", FMT]);
+    let Some(out) = run_bounded(cmd, TMUX_TIMEOUT) else {
+        return TmuxClient::default();
+    };
+    parse_tmux_client(&String::from_utf8_lossy(&out))
 }
 
-/// TERM of the client currently attached to the tmux session (lowercased), e.g.
-/// "xterm-ghostty" / "xterm-kitty" / "xterm-256color". Unlike pane env vars,
-/// this tracks re-attaching from a different terminal emulator.
-fn tmux_client_term() -> Option<String> {
-    tmux_display("#{client_termname}").map(|s| s.to_lowercase())
+/// Parse the reply to the format above: `attached|term|cell_w|cell_h`. Every
+/// field but the first is empty when nobody is attached, and older servers may
+/// not know the cell-size formats at all — so each is optional on its own.
+fn parse_tmux_client(text: &str) -> TmuxClient {
+    let mut f = text.trim().split('|');
+    let attached = f.next().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0) > 0;
+    let term = f.next().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let w = f.next().and_then(|s| s.trim().parse::<u16>().ok());
+    let h = f.next().and_then(|s| s.trim().parse::<u16>().ok());
+    let cell = match (w, h) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    };
+    TmuxClient { attached, term, cell }
 }
 
 /// Pixel size of one cell. Inside tmux the pane pty reports no pixel size, but
-/// the tmux server knows the attached client's cell size exactly — using it
-/// keeps the rendered canvas aligned to real cell boundaries (a wrong guess
+/// the tmux server knows the attached client's cell size exactly (see
+/// [`tmux_client`]) — using it keeps the rendered canvas aligned to real cell
+/// boundaries (a wrong guess
 /// leaves sub-cell slivers at the image's right/bottom edges that terminals
 /// fill with the sixel background, i.e. white strips). Outside tmux, TIOCGWINSZ;
 /// falls back to a common 8×16.
 fn cell_pixel_size() -> (u16, u16) {
     if in_tmux() {
-        if let Some(wh) = tmux_cell_size() {
+        if let Some(wh) = tmux_client().cell {
             return wh;
         }
     }
@@ -474,16 +817,6 @@ fn cell_pixel_size() -> (u16, u16) {
         }
     }
     (8, 16)
-}
-
-/// The attached tmux client's cell size in pixels (tracks re-attaching from a
-/// different terminal, like [`tmux_client_term`]).
-fn tmux_cell_size() -> Option<(u16, u16)> {
-    let s = tmux_display("#{client_cell_width} #{client_cell_height}")?;
-    let mut it = s.split_whitespace();
-    let w: u16 = it.next()?.parse().ok()?;
-    let h: u16 = it.next()?.parse().ok()?;
-    (w > 0 && h > 0).then_some((w, h))
 }
 
 /// Wrap a control sequence for tmux passthrough when `tmux` is set (double each
@@ -538,6 +871,111 @@ mod tests {
         let mut sixel = ImagePreview::new();
         sixel.shown = Some(shown((0, 0, 4, 4), true));
         assert_eq!(sixel.clear(&mut out).unwrap().map(|(_, s)| s), Some(true));
+    }
+
+    /// Spawn a renderer that outlives a naive kill: a shell that does *not*
+    /// `exec`, so the `sleep` is a grandchild holding the stdout pipe open. That
+    /// is the shape a `[preview]` wrapper script has, and waiting for EOF on a
+    /// pipe a grandchild still holds is a hang all of its own.
+    fn stubborn_renderer() -> Child {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30; echo done"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        cmd.spawn().expect("spawn wrapper")
+    }
+
+    /// A renderer we've stopped caring about must actually die. Without this the
+    /// child outlives rustranger — reparented to init, still rasterizing a page
+    /// nobody will see.
+    #[test]
+    fn cancelling_kills_the_renderer() {
+        let mut child = stubborn_renderer();
+        let group = child.id() as libc::pid_t;
+        let cancel = AtomicBool::new(true); // already abandoned
+        let started = Instant::now();
+        let (_, _, outcome) = collect(&mut child, &cancel, Duration::from_secs(60)).unwrap();
+        assert!(matches!(outcome, Outcome::Cancelled), "should report a cancel");
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+        // Nothing of that renderer is left running, grandchildren included.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            unsafe { libc::kill(-group, 0) },
+            -1,
+            "the renderer's process group is still alive"
+        );
+    }
+
+    /// A renderer that never finishes must not be waited on forever: that is what
+    /// pins the run loop to its 50 ms "a preview is coming" tick for good.
+    #[test]
+    fn a_stuck_renderer_times_out_and_is_killed() {
+        let mut child = stubborn_renderer();
+        let started = Instant::now();
+        let (_, _, outcome) =
+            collect(&mut child, &AtomicBool::new(false), Duration::from_millis(200)).unwrap();
+        assert!(matches!(outcome, Outcome::TimedOut), "should report a timeout");
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    }
+
+    /// The whole reason both pipes are drained as they fill: a full-page sixel is
+    /// far larger than a pipe buffer, and a renderer nobody reads simply blocks.
+    #[test]
+    fn collects_far_more_output_than_a_pipe_buffer_holds() {
+        const BYTES: usize = 1_000_000;
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &format!("yes x | head -c {BYTES}")])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn writer");
+        let (out, _, outcome) =
+            collect(&mut child, &AtomicBool::new(false), Duration::from_secs(30)).unwrap();
+        assert!(matches!(outcome, Outcome::Exited(s) if s.success()), "writer should finish");
+        assert_eq!(out.len(), BYTES, "every byte of the render must reach us");
+    }
+
+    /// The reply shapes that actually come back from tmux 3.4: nobody attached,
+    /// a client attached, and a server too old to know the cell-size formats.
+    #[test]
+    fn tmux_reply_parsing_covers_attached_detached_and_old_servers() {
+        let detached = parse_tmux_client("0|||");
+        assert!(!detached.attached, "nobody is watching");
+        assert!(detached.term.is_none() && detached.cell.is_none());
+
+        let attached = parse_tmux_client("1|xterm-ghostty|9|18");
+        assert!(attached.attached);
+        assert_eq!(attached.term.as_deref(), Some("xterm-ghostty"));
+        assert_eq!(attached.cell, Some((9, 18)));
+
+        // An old server expands unknown formats to nothing: still attached, and
+        // still worth rendering — we just fall back for the cell size.
+        let old = parse_tmux_client("1|xterm-256color||");
+        assert!(old.attached);
+        assert_eq!(old.term.as_deref(), Some("xterm-256color"));
+        assert_eq!(old.cell, None);
+
+        // A garbled or empty answer must read as "no client", never as attached.
+        assert!(!parse_tmux_client("").attached);
+        assert!(!parse_tmux_client("nonsense").attached);
+    }
+
+    /// The UI thread runs this, so a wedged tmux server must cost a hitch, not
+    /// the session.
+    #[test]
+    fn a_hung_helper_is_bounded_and_killed() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30"]);
+        let started = Instant::now();
+        assert!(run_bounded(cmd, Duration::from_millis(200)).is_none(), "should give up");
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
     }
 
     #[test]
