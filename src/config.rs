@@ -96,6 +96,16 @@ pub struct Settings {
     pub theme: Theme,
     pub confirm_on_delete: bool,
     pub wrap_scroll: bool,
+    /// While a full-screen child (editor/pager/TUI) runs, override the terminal's
+    /// *default* background with the theme background via `OSC 11`, so the handoff
+    /// never flashes the terminal's own background before the child's theme loads.
+    ///
+    /// Off by default because it makes the child mis-detect the terminal's colors:
+    /// programs that pick a light/dark theme by querying `OSC 11` (nvim, and any
+    /// auto light/dark switcher) read our override instead of the real terminal,
+    /// which can put them in a fight with a system-appearance-based switcher.
+    /// Cosmetic when on, correctness when off — so honesty wins.
+    pub override_terminal_bg: bool,
     /// Report mouse events (wheel scrolls, left click enters, right click goes up).
     /// While on, the terminal's own click-drag text selection needs the usual
     /// override modifier (Shift, or Option/Alt on macOS) — hence the `zm` toggle.
@@ -271,6 +281,7 @@ impl Settings {
             "confirm_on_delete" => self.confirm_on_delete = as_bool(value),
             "wrap_scroll" => self.wrap_scroll = as_bool(value),
             "mouse_enabled" => self.mouse_enabled = as_bool(value),
+            "override_terminal_bg" => self.override_terminal_bg = as_bool(value),
             _ => {}
         }
     }
@@ -347,6 +358,13 @@ confirm_on_delete = true
 wrap_scroll = false
 mouse_enabled = true           # wheel scrolls, left click enters, right click goes up
                                # (toggle: zm — turn off for native text selection)
+override_terminal_bg = false   # while an editor/pager runs, force the terminal's
+                               # DEFAULT background (OSC 11) to the theme background.
+                               # Hides the handoff flash when your theme differs from
+                               # the terminal's, but lies to programs that pick a
+                               # light/dark theme by querying OSC 11 (e.g. nvim with
+                               # automatic appearance switching) — leave off unless
+                               # the flash bothers you more.
 show_date = true               # date column next to the size (current column)
 time_type = \"modified\"         # modified|created|changed|accessed
 time_format = \"date\"           # date (YYYY/MM/DD) | datetime (YYYY/MM/DD/HH/MM)
@@ -530,6 +548,7 @@ impl Default for Settings {
             confirm_on_delete: true,
             wrap_scroll: false,
             mouse_enabled: true,
+            override_terminal_bg: false,
             hidden_filter_dotfiles: true,
             openers: Vec::new(),
             preview_cmds: Vec::new(),
@@ -583,6 +602,8 @@ mod tests {
         // Image preview and mouse support are on by default.
         assert!(s.preview_images);
         assert!(s.mouse_enabled);
+        // Off by default: never mislead a child program's OSC 11 color query.
+        assert!(!s.override_terminal_bg);
     }
 
     #[test]

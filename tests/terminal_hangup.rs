@@ -89,7 +89,9 @@ impl PtySession {
                 if libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) < 0 {
+                // TIOCSCTTY is u32 on macOS/BSD but c_ulong on Linux; cast so this
+                // compiles on both.
+                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())

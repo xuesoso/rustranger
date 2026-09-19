@@ -407,7 +407,8 @@ fn run(app: &mut App) -> io::Result<()> {
                 mouse_on = false;
             }
             let bg = app.settings.theme.bg;
-            let (suspended, error) = run_external(&mut out, req, bg)?;
+            let override_bg = app.settings.override_terminal_bg;
+            let (suspended, error) = run_external(&mut out, req, bg, override_bg)?;
             if suspended {
                 needs_full = true;
             }
@@ -539,6 +540,7 @@ fn run_external(
     out: &mut io::Stdout,
     req: open::RunRequest,
     bg: crossterm::style::Color,
+    override_bg: bool,
 ) -> io::Result<(bool, Option<String>)> {
     use std::process::{Command, Stdio};
     if req.argv.is_empty() {
@@ -549,13 +551,13 @@ fn run_external(
 
     if req.block {
         if req.fullscreen {
-            suspend_keep_screen(bg)?;
+            suspend_keep_screen(bg, override_bg)?;
         } else {
             restore_terminal()?;
         }
         let status = cmd.status();
         if req.fullscreen {
-            resume_keep_screen(bg)?;
+            resume_keep_screen(bg, override_bg)?;
         } else {
             setup_terminal()?;
         }
@@ -582,41 +584,64 @@ fn run_external(
 /// drops to the primary buffer's default background — eliminating the dark→white→
 /// dark flash and leaving the shell's scrollback untouched.
 ///
-/// The subtle part is the window *before* the child's own theme loads. A captured
-/// nvim startup shows it reset SGR (`ESC[0m`) and repaint every row with the
-/// terminal's **default** background — it even queries that default via `OSC 11` —
-/// so setting our SGR background isn't enough on its own. We therefore also override
-/// the terminal's *default* background with `OSC 11` for the duration of the child,
-/// so that transitional paint (and the child's query) comes back dark, not white.
-/// Paired with the `OSC 111` reset in [`resume_keep_screen`]. (No-op for the
-/// `default` theme, whose background is the terminal default already.)
-fn suspend_keep_screen(bg: crossterm::style::Color) -> io::Result<()> {
-    use crossterm::style::SetBackgroundColor;
-    use crossterm::terminal::{Clear, ClearType, EnableLineWrap};
+/// The remaining window is *before* the child's own theme loads: a captured nvim
+/// startup shows it reset SGR (`ESC[0m`) and repaint every row with the terminal's
+/// **default** background, so our SGR background alone doesn't cover it. Overriding
+/// the terminal's *default* background with `OSC 11` for the duration of the child
+/// does — but only by lying to the child about the terminal's colors, which breaks
+/// programs that pick a light/dark theme by querying `OSC 11` (nvim, and anything
+/// doing automatic appearance switching: our answer fights the real system state).
+/// So that override is opt-in via `override_terminal_bg`, off by default: a brief
+/// flash beats hijacking the editor's theme. (No-op either way for the `default`
+/// theme, whose background is the terminal default already.)
+fn suspend_keep_screen(bg: crossterm::style::Color, override_bg: bool) -> io::Result<()> {
     let mut out = io::stdout();
-    execute!(out, cursor::Show, EnableLineWrap, SetBackgroundColor(bg), Clear(ClearType::All))?;
-    if let Some(seq) = osc_set_default_bg(bg) {
-        out.write_all(seq.as_bytes())?;
-        out.flush()?;
-    }
+    out.write_all(&suspend_bytes(bg, override_bg))?;
+    out.flush()?;
     disable_raw_mode()?;
     Ok(())
 }
 
-/// Resume after a full-screen child. Undo the `OSC 11` default-background override,
-/// then re-assert our alternate screen — with the theme background set first so the
-/// enter-clear is dark, not the terminal default. A full repaint follows on the next
-/// frame (the caller returns `true`).
-fn resume_keep_screen(bg: crossterm::style::Color) -> io::Result<()> {
+/// The escape sequence [`suspend_keep_screen`] emits (split out to be testable):
+/// show the cursor, restore wrapping, paint our theme background over the screen,
+/// and — only with `override_bg` — lie about the terminal's default background.
+fn suspend_bytes(bg: crossterm::style::Color, override_bg: bool) -> Vec<u8> {
     use crossterm::style::SetBackgroundColor;
-    use crossterm::terminal::DisableLineWrap;
+    use crossterm::terminal::{Clear, ClearType, EnableLineWrap};
+    let mut seq: Vec<u8> = Vec::new();
+    let _ = crossterm::queue!(seq, cursor::Show, EnableLineWrap, SetBackgroundColor(bg), Clear(ClearType::All));
+    if override_bg {
+        if let Some(osc) = osc_set_default_bg(bg) {
+            seq.extend_from_slice(osc.as_bytes());
+        }
+    }
+    seq
+}
+
+/// Resume after a full-screen child. Undo the `OSC 11` default-background override
+/// if we set one, then re-assert our alternate screen — with the theme background
+/// set first so the enter-clear is dark, not the terminal default. A full repaint
+/// follows on the next frame (the caller returns `true`).
+fn resume_keep_screen(bg: crossterm::style::Color, override_bg: bool) -> io::Result<()> {
     let mut out = io::stdout();
     enable_raw_mode()?;
-    if osc_set_default_bg(bg).is_some() {
-        out.write_all(OSC_RESET_DEFAULT_BG.as_bytes())?;
-    }
-    execute!(out, SetBackgroundColor(bg), EnterAlternateScreen, cursor::Hide, DisableLineWrap)?;
+    out.write_all(&resume_bytes(bg, override_bg))?;
+    out.flush()?;
     Ok(())
+}
+
+/// The escape sequence [`resume_keep_screen`] emits (split out to be testable).
+fn resume_bytes(bg: crossterm::style::Color, override_bg: bool) -> Vec<u8> {
+    use crossterm::style::SetBackgroundColor;
+    use crossterm::terminal::DisableLineWrap;
+    let mut seq: Vec<u8> = Vec::new();
+    // Reset only what we actually set: an unconditional OSC 111 would clobber a
+    // default background someone else (a shell theme script) had configured.
+    if override_bg && osc_set_default_bg(bg).is_some() {
+        seq.extend_from_slice(OSC_RESET_DEFAULT_BG.as_bytes());
+    }
+    let _ = crossterm::queue!(seq, SetBackgroundColor(bg), EnterAlternateScreen, cursor::Hide, DisableLineWrap);
+    seq
 }
 
 /// `OSC 11` sequence setting the terminal's *default* background to a concrete RGB
@@ -926,5 +951,36 @@ mod tests {
         assert_eq!(osc_set_default_bg(Color::Reset), None);
         // Named/indexed colours aren't overridden either (no reliable RGB).
         assert_eq!(osc_set_default_bg(Color::Blue), None);
+    }
+
+    /// Suspending for an editor must NOT redefine the terminal's default
+    /// background unless the user opted in. Programs that choose a light/dark
+    /// theme by querying OSC 11 (nvim, and auto appearance switchers) read that
+    /// value; answering with our theme instead of the terminal's real color put
+    /// them in an endless fight with a system-appearance-based switcher.
+    #[test]
+    fn suspend_does_not_redefine_terminal_bg_by_default() {
+        let dark = Color::Rgb { r: 0x2e, g: 0x34, b: 0x40 };
+        let set_bg = "\x1b]11;rgb:";
+
+        let quiet = String::from_utf8(suspend_bytes(dark, false)).unwrap();
+        assert!(!quiet.contains(set_bg), "default must not set OSC 11: {quiet:?}");
+        // The cosmetic half still happens: we paint the screen in our own theme.
+        assert!(quiet.contains("\x1b[2J"), "screen still cleared to the theme bg");
+
+        // Opted in, the override is emitted...
+        let loud = String::from_utf8(suspend_bytes(dark, true)).unwrap();
+        assert!(loud.contains("\x1b]11;rgb:2e/34/40"), "opt-in sets OSC 11: {loud:?}");
+
+        // ...and is undone on resume — but only when we actually set it, so we
+        // never clobber a default background configured by something else.
+        let resume_loud = String::from_utf8(resume_bytes(dark, true)).unwrap();
+        assert!(resume_loud.contains("\x1b]111"), "opt-in resets OSC 11 on resume");
+        let resume_quiet = String::from_utf8(resume_bytes(dark, false)).unwrap();
+        assert!(!resume_quiet.contains("\x1b]111"), "never reset what we didn't set");
+
+        // A non-RGB theme background has nothing to override either way.
+        let reset_theme = String::from_utf8(resume_bytes(Color::Reset, true)).unwrap();
+        assert!(!reset_theme.contains("\x1b]111"));
     }
 }

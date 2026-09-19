@@ -112,6 +112,8 @@ preview_files = true
 draw_borders = true
 confirm_on_delete = true
 wrap_scroll = false
+mouse_enabled = true        # wheel/click support (toggle at runtime with zm)
+override_terminal_bg = false # see "Editors and terminal background" below
 show_date = true            # show a date column next to the size (current column)
 time_type = "modified"      # modified|created|changed|accessed
 time_format = "date"        # date (YYYY/MM/DD) | datetime (YYYY/MM/DD/HH/MM)
@@ -123,6 +125,22 @@ theme = "default"           # see "Color themes" below
 the Linux inode change-time convention), `accessed` (atime), and `created`
 (birthtime where the platform/FS supports it — native on macOS, via statx on
 recent Linux; falls back to mtime otherwise).
+
+### Editors and terminal background
+
+When you open a file in a full-screen program (editor/pager), rustranger keeps its
+alternate screen and paints the handoff in your theme background, so the terminal's
+own background never flashes through.
+
+If your theme differs from the terminal's, a brief flash can still show while the
+editor starts, before its own colors load. `override_terminal_bg = true` removes it
+by redefining the terminal's *default* background (`OSC 11`) for as long as the
+child runs. **This is off by default**, because it also makes the child mis-detect
+the terminal: programs that choose a light or dark theme by querying `OSC 11` —
+nvim, and anything doing automatic light/dark switching — read rustranger's answer
+instead of the real terminal. With a dark rustranger theme on a light system (or
+vice versa) that can leave the editor's own appearance switcher flip-flopping.
+Turn it on only if the flash bothers you more than that.
 
 ### Color themes
 
