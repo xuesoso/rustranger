@@ -25,6 +25,11 @@ static TERMINATE: AtomicBool = AtomicBool::new(false);
 /// short of "burns a core until the user notices".
 const HANGUP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// True while a blocking external program (editor/pager/shell) owns the terminal
+/// and rustranger is merely the parent waiting behind it. The shutdown backstop
+/// stands down for the duration: that wait is legitimate, however long it runs.
+static SUSPENDED: AtomicBool = AtomicBool::new(false);
+
 extern "C" fn on_terminate(_sig: libc::c_int) {
     // A relaxed atomic store is async-signal-safe; everything else happens on
     // the main thread once the loop observes the flag.
@@ -161,7 +166,16 @@ fn main() -> io::Result<()> {
     // so noticing the hangup is on us. Watch for it directly; the run loop then
     // leaves through the normal path, and the watchdog force-exits if it can't
     // (see `tty`), so we never leave a detached CPU-spinning orphan.
-    tty::watch_hangup(HANGUP_GRACE, || TERMINATE.store(true, Ordering::Relaxed));
+    tty::watch_hangup(
+        HANGUP_GRACE,
+        || TERMINATE.store(true, Ordering::Relaxed),
+        // Reached only if the run loop never got to shut down. `_exit` runs no
+        // destructors, so the renderer's own cleanup will not happen — kill it
+        // here or it outlives us as an orphan.
+        rustranger::imgpreview::kill_live_renderers,
+    );
+    // ...and a backstop for a shutdown that starts but never finishes.
+    watch_shutdown(HANGUP_GRACE);
     // Restore the terminal even if we panic mid-render.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -173,6 +187,41 @@ fn main() -> io::Result<()> {
 
     restore_terminal()?;
     result
+}
+
+/// Force-exit backstop for a shutdown that never finishes.
+///
+/// Setting `TERMINATE` *asks* the run loop to leave, and normally it does so
+/// within one idle tick. But the main thread can be somewhere it will not come
+/// back from by itself — most reachably blocked in `write(2)` to a terminal that
+/// has stopped draining (flow control, a frozen or suspended emulator). Signals
+/// installed with `signal(3)` restart such a call rather than failing it, and
+/// `write_all` retries `EINTR` regardless, so the loop never regains control to
+/// notice the flag. The process then sits there having been told to die: a
+/// dangling process that plain `kill` cannot shift.
+///
+/// So once asked to terminate, give the loop `grace`, then take any renderers
+/// with us and go. Held off while an external program owns the terminal.
+fn watch_shutdown(grace: std::time::Duration) {
+    std::thread::spawn(move || {
+        let tick = std::time::Duration::from_millis(100);
+        loop {
+            std::thread::sleep(tick);
+            if !TERMINATE.load(Ordering::Relaxed) {
+                continue;
+            }
+            std::thread::sleep(grace);
+            // An external program is running: rustranger is supposed to be
+            // waiting, so this is not a stuck shutdown. Re-check later.
+            if SUSPENDED.load(Ordering::Relaxed) {
+                continue;
+            }
+            // `_exit` runs no destructors, so clean up what would have been.
+            rustranger::imgpreview::kill_live_renderers();
+            // SAFETY: _exit is async-signal-safe and performs no unwinding.
+            unsafe { libc::_exit(0) };
+        }
+    });
 }
 
 /// `gen-config` subcommand: write a default config.toml, but only if one does not
@@ -244,6 +293,9 @@ fn run(app: &mut App) -> io::Result<()> {
     let mut needs_full = false;
     // In-pane image/document preview (kitty/sixel graphics over the preview box).
     let mut img = rustranger::imgpreview::ImagePreview::new();
+    // Detached programs we started (`[open]` entries ending in `&`). They outlive
+    // the launch by design, so they are reaped here rather than waited on.
+    let mut detached: Vec<std::process::Child> = Vec::new();
     // Whether the terminal is currently reporting mouse events. Re-synced against
     // the setting every frame, so `zm` takes effect immediately and an external
     // program that clobbered the mode gets it restored.
@@ -355,6 +407,9 @@ fn run(app: &mut App) -> io::Result<()> {
         } else {
             500
         };
+        // Collect any detached program that has since exited, so a long session
+        // of opening files doesn't accumulate zombies.
+        reap(&mut detached);
         // Wait for input ourselves rather than blocking inside crossterm, whose
         // event source spins forever on a hung-up terminal (see `tty`). Anything
         // crossterm still has parsed comes out first; otherwise sleep on the fd.
@@ -408,7 +463,8 @@ fn run(app: &mut App) -> io::Result<()> {
             }
             let bg = app.settings.theme.bg;
             let override_bg = app.settings.override_terminal_bg;
-            let (suspended, error) = run_external(&mut out, req, bg, override_bg)?;
+            let (suspended, error) =
+                run_external(&mut out, req, bg, override_bg, &mut detached)?;
             if suspended {
                 needs_full = true;
             }
@@ -423,6 +479,16 @@ fn run(app: &mut App) -> io::Result<()> {
     let _ = img.clear(&mut out);
     out.flush()?;
     Ok(())
+}
+
+/// Wait for any detached child that has exited, dropping it from the list.
+///
+/// A `std::process::Child` neither kills nor waits on drop, so without this every
+/// `[open]` program run with a trailing `&` stays in the process table as a zombie
+/// until rustranger itself exits. Children still running are kept and re-checked
+/// next tick; they are meant to outlive us, and are left alone at quit.
+fn reap(detached: &mut Vec<std::process::Child>) {
+    detached.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
 }
 
 /// Dispatch a single terminal event (ignores key releases and unhandled events;
@@ -541,6 +607,7 @@ fn run_external(
     req: open::RunRequest,
     bg: crossterm::style::Color,
     override_bg: bool,
+    detached: &mut Vec<std::process::Child>,
 ) -> io::Result<(bool, Option<String>)> {
     use std::process::{Command, Stdio};
     if req.argv.is_empty() {
@@ -550,6 +617,7 @@ fn run_external(
     cmd.args(&req.argv[1..]).current_dir(&req.cwd);
 
     if req.block {
+        SUSPENDED.store(true, Ordering::Relaxed);
         if req.fullscreen {
             suspend_keep_screen(bg, override_bg)?;
         } else {
@@ -562,6 +630,7 @@ fn run_external(
             setup_terminal()?;
         }
         out.flush()?;
+        SUSPENDED.store(false, Ordering::Relaxed);
         let error = status
             .err()
             .map(|e| format!("failed to run {}: {}", req.argv[0], e));
@@ -570,10 +639,16 @@ fn run_external(
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let error = cmd
-            .spawn()
-            .err()
-            .map(|e| format!("failed to run {}: {}", req.argv[0], e));
+        // Keep the handle: a `Child` that is simply dropped is never waited for,
+        // so every GUI file we opened would leave a zombie sitting in the process
+        // table for as long as rustranger runs. The loop reaps these each tick.
+        let error = match cmd.spawn() {
+            Ok(child) => {
+                detached.push(child);
+                None
+            }
+            Err(e) => Some(format!("failed to run {}: {}", req.argv[0], e)),
+        };
         Ok((false, error))
     }
 }
@@ -951,6 +1026,36 @@ mod tests {
         assert_eq!(osc_set_default_bg(Color::Reset), None);
         // Named/indexed colours aren't overridden either (no reliable RGB).
         assert_eq!(osc_set_default_bg(Color::Blue), None);
+    }
+
+    /// A detached program that has exited must be waited for, or it lingers as a
+    /// zombie; one still running must be kept and left alone.
+    #[test]
+    fn reap_collects_finished_children_and_keeps_live_ones() {
+        use std::process::{Command, Stdio};
+        let spawn = |argv: &[&str]| {
+            Command::new(argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn")
+        };
+        let mut detached = vec![spawn(&["true"]), spawn(&["sleep", "30"])];
+        let live_pid = detached[1].id();
+
+        // `true` exits immediately; give it a moment, then reap until it is gone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while detached.len() > 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            reap(&mut detached);
+        }
+        assert_eq!(detached.len(), 1, "the finished child was waited for");
+        assert_eq!(detached[0].id(), live_pid, "the running child is kept");
+
+        detached[0].kill().expect("kill");
+        detached[0].wait().expect("wait");
     }
 
     /// Suspending for an editor must NOT redefine the terminal's default

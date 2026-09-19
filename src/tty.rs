@@ -163,15 +163,20 @@ pub fn size() -> Option<(u16, u16)> {
     (rc == 0 && ws.ws_col > 0 && ws.ws_row > 0).then_some((ws.ws_col, ws.ws_row))
 }
 
-/// Has the controlling terminal hung up? Non-blocking. `POLLHUP`/`POLLERR`/
-/// `POLLNVAL` are reported by `poll(2)` whether or not they were requested, so
-/// asking for no events gives a pure "is it still there?" check that never
-/// consumes input crossterm needs.
+/// Has the controlling terminal hung up? Non-blocking, and never consumes the
+/// input crossterm needs — `poll(2)` only reports readiness, it does not read.
+///
+/// **`events` must not be empty.** POSIX says `POLLHUP`/`POLLERR`/`POLLNVAL` are
+/// reported regardless of what was requested, and Linux does exactly that — but
+/// macOS/BSD report nothing at all for a `poll` that asked for nothing, even on
+/// a pty whose master is closed. Asking for `POLLIN` (which a dead terminal sets
+/// anyway, at EOF) is what makes this work on both. Only the `DEAD` bits are
+/// consulted, so pending keystrokes never read as a hangup.
 pub fn hung_up() -> bool {
     let Some(fd) = tty_fd() else {
         return false;
     };
-    let mut pfd = libc::pollfd { fd, events: 0, revents: 0 };
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
     // SAFETY: pfd is a valid, initialised pollfd; poll only reads/writes it.
     let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
     rc > 0 && pfd.revents & DEAD != 0
@@ -186,25 +191,40 @@ pub fn hung_up() -> bool {
 /// crossterm's read loop, or blocked writing to a terminal nobody will ever
 /// drain — it will never observe the flag, so we exit the process outright
 /// rather than leave a detached, CPU-burning orphan behind.
-pub fn watch_hangup(grace: Duration, on_hangup: impl Fn() + Send + 'static) {
+pub fn watch_hangup(
+    grace: Duration,
+    on_hangup: impl Fn() + Send + 'static,
+    before_force_exit: impl Fn() + Send + 'static,
+) {
     if tty_fd().is_none() {
         return;
     }
     std::thread::spawn(move || {
         loop {
-            // -1 blocks until something happens to the fd; with no requested
-            // events that can only be a hangup (or a spurious EINTR wake).
+            // -1 blocks until the fd has something to say. `POLLIN` must be
+            // requested: a poll that asks for nothing is never answered on
+            // macOS/BSD, which would leave this watchdog asleep forever —
+            // exactly when it is the last thing standing (see `hung_up`).
             let fd = tty_fd().unwrap();
-            let mut pfd = libc::pollfd { fd, events: 0, revents: 0 };
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
             // SAFETY: pfd is a valid, initialised pollfd.
             let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
             if rc > 0 && pfd.revents & DEAD != 0 {
                 break;
             }
+            // Woken by ordinary input, which we deliberately do not read — it
+            // belongs to the run loop. Until it is consumed the fd stays ready
+            // and poll would return at once, so pause briefly rather than spin
+            // a core while the user holds a key down.
+            if rc > 0 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
         on_hangup();
         std::thread::sleep(grace);
-        // Still running: the main thread is stuck. Leave immediately.
+        // Still running: the main thread is stuck. Take any child processes with
+        // us — `_exit` runs no destructors, so nothing else will — and go.
+        before_force_exit();
         // SAFETY: _exit is async-signal-safe and performs no unwinding.
         unsafe { libc::_exit(0) };
     });
@@ -225,17 +245,38 @@ mod tests {
         }
     }
 
-    /// A pipe whose write end is closed is the shape of a dead terminal: poll
-    /// reports POLLHUP even though we asked for no events. This is the signal
-    /// the watchdog and `wait` are built on, so pin it down.
+    /// A pipe whose write end is closed is the shape of a dead terminal. It is
+    /// the signal the watchdog and `wait` are built on, so pin down the contract
+    /// they actually rely on: **the poll must request `POLLIN`**.
+    ///
+    /// POSIX says `POLLHUP` is reported whatever you asked for, and Linux obliges,
+    /// but macOS/BSD answer a poll that requested nothing with nothing — verified
+    /// here on both, by asserting only the armed form. An unarmed poll is left
+    /// untested precisely because its answer is platform-dependent; every caller
+    /// in this module arms `POLLIN` so none of them depend on it.
     #[test]
-    fn closed_pipe_polls_as_hangup() {
+    fn closed_pipe_polls_as_hangup_when_armed() {
         let mut fds = [0 as libc::c_int; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         unsafe { libc::close(fds[1]) }; // writer gone: the "terminal" hung up
-        let mut pfd = libc::pollfd { fd: fds[0], events: 0, revents: 0 };
+        let mut pfd = libc::pollfd { fd: fds[0], events: libc::POLLIN, revents: 0 };
         let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
         assert!(rc > 0 && pfd.revents & DEAD != 0, "revents={}", pfd.revents);
         unsafe { libc::close(fds[0]) };
+    }
+
+    /// Guard the fix itself: no poll in this module may leave `events` empty, or
+    /// it silently stops noticing hangups on macOS while still passing on Linux.
+    #[test]
+    fn every_poll_in_this_module_arms_events() {
+        let src = include_str!("tty.rs");
+        for (n, line) in src.lines().enumerate() {
+            // Leading space so this doesn't also match the `revents: 0` field,
+            // which ends in the very same characters.
+            let is_decl = line.contains("libc::pollfd {") && line.contains("events:");
+            if is_decl && line.contains(" events: 0") {
+                panic!("tty.rs:{}: poll with empty events is unanswered on macOS: {}", n + 1, line.trim());
+            }
+        }
     }
 }

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,54 @@ use crate::config::PreviewProtocol;
 /// folio's fixed kitty image id — the `[preview]` renderer uses it, so we delete
 /// that id to clear. (Value: bytes of "pdf".)
 const KITTY_IMAGE_ID: u32 = 0x0070_6466;
+
+/// Process-group ids of renderers running right now.
+///
+/// The orderly shutdown path is [`ImagePreview::drop`], which cancels the render
+/// and waits for the thread to reap its child. That covers quitting and panics,
+/// but not `_exit(2)` — the hangup watchdog's last resort — which runs no
+/// destructors at all. Without this registry a forced exit would strand a
+/// half-finished `folio` rasterizing a large page: reparented to init, invisible,
+/// burning a core, exactly the orphan the watchdog exists to prevent.
+static LIVE_RENDERERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Registers a renderer for the lifetime of [`run_renderer`], so it is removed
+/// however that function returns (success, timeout, cancel, or error).
+struct Registered(u32);
+
+impl Registered {
+    fn new(pid: u32) -> Registered {
+        if let Ok(mut live) = LIVE_RENDERERS.lock() {
+            live.push(pid);
+        }
+        Registered(pid)
+    }
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        if let Ok(mut live) = LIVE_RENDERERS.lock() {
+            live.retain(|&p| p != self.0);
+        }
+    }
+}
+
+/// Kill every renderer still running, immediately and without waiting.
+///
+/// For use on paths that will not run destructors — the watchdog's forced exit.
+/// Each renderer got a process group of its own at spawn, so the negated pid
+/// takes any helpers a shell-wrapped `[preview]` command started as well.
+/// `try_lock` because this runs when the process is already being abandoned:
+/// a registry busy for a moment is not worth deadlocking the exit over.
+pub fn kill_live_renderers() {
+    if let Ok(live) = LIVE_RENDERERS.try_lock() {
+        for &pid in live.iter() {
+            // SAFETY: kill(2) with a negated pid signals that process group;
+            // a stale pid can only fail with ESRCH, which we ignore.
+            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+        }
+    }
+}
 
 /// How long the selection must rest on a file before its preview starts, so fast
 /// scrolling through a directory of images doesn't spawn a renderer per file.
@@ -469,6 +517,9 @@ fn run_renderer(
             return Err(format!("{prog}: {e}"));
         }
     };
+    // Track it until this function returns, so a forced exit (which runs no
+    // destructors) can still take the renderer with it.
+    let _registered = Registered::new(child.id());
     let collected = collect(&mut child, cancel, RENDER_TIMEOUT);
     let (stdout, stderr, status) = match collected {
         Ok(v) => v,
@@ -707,6 +758,9 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
         });
     }
     let mut child = cmd.spawn().ok()?;
+    // Registered like a renderer: this runs on the UI thread, so a forced exit
+    // can land while the query is still in flight.
+    let _registered = Registered::new(child.id());
     let (out, _, outcome) = collect(&mut child, &AtomicBool::new(false), timeout).ok()?;
     matches!(outcome, Outcome::Exited(s) if s.success()).then_some(out)
 }
@@ -895,6 +949,34 @@ mod tests {
     /// A renderer we've stopped caring about must actually die. Without this the
     /// child outlives rustranger — reparented to init, still rasterizing a page
     /// nobody will see.
+    /// The forced-exit path must actually kill a running renderer: spawn a real
+    /// child in its own process group (as `run_renderer` does), register it, and
+    /// check `kill_live_renderers` takes it down.
+    #[test]
+    fn force_exit_kills_a_registered_renderer() {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        // SAFETY: setpgid is async-signal-safe and is all the closure does.
+        unsafe { cmd.pre_exec(|| { libc::setpgid(0, 0); Ok(()) }) };
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id();
+
+        let registered = Registered::new(pid);
+        assert!(LIVE_RENDERERS.lock().unwrap().contains(&pid), "tracked while running");
+        // Still alive before we ask it to die.
+        assert!(matches!(child.try_wait(), Ok(None)), "sleep should still be running");
+
+        kill_live_renderers();
+        let status = child.wait().expect("wait");
+        assert!(!status.success(), "killed, not a clean exit: {status:?}");
+
+        // Deregistering on return is what keeps the kill list from growing or
+        // naming a pid the OS has since handed to somebody else.
+        drop(registered);
+        assert!(!LIVE_RENDERERS.lock().unwrap().contains(&pid), "untracked once done");
+    }
+
     #[test]
     fn cancelling_kills_the_renderer() {
         let mut child = stubborn_renderer();
