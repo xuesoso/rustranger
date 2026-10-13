@@ -25,9 +25,32 @@ use std::time::{Duration, Instant};
 use crate::app::App;
 use crate::config::PreviewProtocol;
 
-/// folio's fixed kitty image id — the `[preview]` renderer uses it, so we delete
-/// that id to clear. (Value: bytes of "pdf".)
-const KITTY_IMAGE_ID: u32 = 0x0070_6466;
+/// folio's own fixed kitty image id (bytes of "pdf"), and the next one, which
+/// its interactive viewer alternates with. Ours must never be either.
+const FOLIO_IMAGE_IDS: [u32; 2] = [0x0070_6466, 0x0070_6467];
+
+/// The kitty image id this rustranger transmits its previews under, handed to
+/// the renderer as `%i` and `$FOLIO_IMAGE_ID`.
+///
+/// Image ids belong to the *outer* terminal, and every tmux pane feeds the same
+/// one — so instances sharing a fixed id all point their placeholder cells at a
+/// single image: every pane shows whichever preview was sent last, cut to the
+/// wrong cell grid, and one pane's clear deletes the others' pictures. Our pid
+/// is unique among the processes on this host and needs no coordination. It
+/// fits the 24 bits a placeholder's foreground color can carry (pids top out
+/// at 2^22 on Linux, under 100k on macOS); the mask and fix-ups only guard
+/// against a platform where that doesn't hold.
+pub fn instance_image_id() -> u32 {
+    image_id_for_pid(std::process::id())
+}
+
+fn image_id_for_pid(pid: u32) -> u32 {
+    let mut id = pid & 0x00FF_FFFF;
+    if FOLIO_IMAGE_IDS.contains(&id) {
+        id ^= 0x0080_0000;
+    }
+    id.max(1) // 0 means "no id" to the protocol
+}
 
 /// Process-group ids of renderers running right now.
 ///
@@ -156,6 +179,11 @@ struct Shown {
     /// cell grid, so clearing needs a full cell repaint (kitty has a delete cmd).
     sixel: bool,
     tmux: bool,
+    /// The kitty image id the renderer actually transmitted under, read back
+    /// from its output (see [`kitty_image_id`]) — what `clear` must delete. Not
+    /// assumed to be ours: a renderer that ignores `%i`/`$FOLIO_IMAGE_ID` (an
+    /// older folio) still uses its own id, and that is the one on screen.
+    kitty_id: Option<u32>,
     /// Theme background at draw time — the box is repainted with it on clear, so
     /// transitions never flash the terminal's own background (the kitty-in-tmux
     /// placeholder cells are written outside our cell model with an unknown bg).
@@ -277,13 +305,14 @@ impl ImagePreview {
                         match result {
                             Ok(bytes) if !bytes.is_empty() => {
                                 res.record_clear(self.clear(out)?);
-                                out.write_all(&bytes)?;
-                                out.flush()?;
+                                let kitty_id = kitty_image_id(&bytes);
+                                emit(out, &bytes, inf.tmux && kitty_id.is_some())?;
                                 self.shown = Some(Shown {
                                     path: inf.path,
                                     rect: inf.rect,
                                     sixel: inf.sixel,
                                     tmux: inf.tmux,
+                                    kitty_id,
                                     bg: inf.bg,
                                 });
                             }
@@ -359,10 +388,12 @@ impl ImagePreview {
             return Ok(None);
         };
         let mut seq: Vec<u8> = Vec::new();
-        // Kitty: delete the image by id (a clean overlay removal). Harmless when
-        // the image was sixel (there is no such kitty image).
-        let del = format!("\x1b_Ga=d,d=I,i={KITTY_IMAGE_ID}\x1b\\");
-        seq.extend_from_slice(&maybe_tmux(del.as_bytes(), s.tmux));
+        // Kitty: delete the image by id (a clean overlay removal) — the id it
+        // was sent under, so other panes' images survive.
+        if let Some(id) = s.kitty_id {
+            let del = format!("\x1b_Ga=d,d=I,i={id}\x1b\\");
+            seq.extend_from_slice(&maybe_tmux(del.as_bytes(), s.tmux));
+        }
         // Repaint the box with the theme background so the transition never
         // flashes the terminal's own background: the kitty-in-tmux placeholder
         // cells were written outside our cell model (with an unknown bg), and
@@ -375,8 +406,7 @@ impl ImagePreview {
             let _ = crossterm::queue!(seq, MoveTo(x, top + r), Print(&blank));
         }
         let _ = crossterm::queue!(seq, ResetColor);
-        out.write_all(&seq)?;
-        out.flush()?;
+        emit(out, &seq, s.tmux && s.kitty_id.is_some())?;
         // Sixel/iterm pixels may survive cell overwrites on some terminals; keep
         // the full repaint as the reliable eraser there. Kitty needs none.
         Ok(Some((s.rect, s.sixel)))
@@ -415,12 +445,13 @@ impl ImagePreview {
         let (cell_w, cell_h) = cell_pixel_size();
         let tmux = in_tmux();
         let bg = theme_bg_hex(app);
+        let id = instance_image_id();
         let (tx, rx) = mpsc::channel();
         let p = path.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancel);
         thread::spawn(move || {
-            let _ = tx.send(run_renderer(&tmpl, &p, rect, proto, cell_w, cell_h, tmux, &bg, &flag));
+            let _ = tx.send(run_renderer(&tmpl, &p, rect, proto, cell_w, cell_h, tmux, &bg, id, &flag));
         });
         // Assigning replaces any previous Inflight, whose CancelOnDrop stops the
         // render it stood for — so a burst of navigation leaves one renderer
@@ -448,28 +479,10 @@ fn run_renderer(
     cell_h: u16,
     tmux: bool,
     bg: &str,
+    image_id: u32,
     cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
-    let (x, y, c, r) = rect;
-    let path_str = path.to_string_lossy();
-    // Substitute per whitespace-token so a `%f` path with spaces stays one arg,
-    // and `%t` can drop out entirely when not in tmux.
-    let argv: Vec<String> = template
-        .split_whitespace()
-        .map(|tok| {
-            tok.replace("%f", &path_str)
-                .replace("%p", proto)
-                .replace("%x", &x.to_string())
-                .replace("%y", &y.to_string())
-                .replace("%c", &c.to_string())
-                .replace("%r", &r.to_string())
-                .replace("%w", &cell_w.to_string())
-                .replace("%h", &cell_h.to_string())
-                .replace("%b", bg)
-                .replace("%t", if tmux { "--tmux" } else { "" })
-        })
-        .filter(|s| !s.is_empty())
-        .collect();
+    let argv = renderer_argv(template, path, rect, proto, cell_w, cell_h, tmux, bg, image_id);
     let Some((prog, args)) = argv.split_first() else {
         return Err("empty preview command".to_string());
     };
@@ -486,6 +499,9 @@ fn run_renderer(
     // stdin is closed: a renderer must never read the keystrokes meant for us.
     let mut cmd = Command::new(prog);
     cmd.args(args)
+        // folio reads its image id from here when the command line doesn't give
+        // one, so configs written before `%i` existed still get a per-pane id.
+        .env("FOLIO_IMAGE_ID", image_id.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -552,6 +568,159 @@ fn run_renderer(
     }
     log(&format!("  -> ok, {} bytes of escapes", stdout.len()));
     Ok(stdout)
+}
+
+/// Expand a `[preview]` command template into argv.
+#[allow(clippy::too_many_arguments)]
+fn renderer_argv(
+    template: &str,
+    path: &Path,
+    rect: Rect,
+    proto: &str,
+    cell_w: u16,
+    cell_h: u16,
+    tmux: bool,
+    bg: &str,
+    image_id: u32,
+) -> Vec<String> {
+    let (x, y, c, r) = rect;
+    let path_str = path.to_string_lossy();
+    // Substitute per whitespace-token so a `%f` path with spaces stays one arg,
+    // and `%t` can drop out entirely when not in tmux.
+    template
+        .split_whitespace()
+        .map(|tok| {
+            tok.replace("%f", &path_str)
+                .replace("%p", proto)
+                .replace("%x", &x.to_string())
+                .replace("%y", &y.to_string())
+                .replace("%c", &c.to_string())
+                .replace("%r", &r.to_string())
+                .replace("%w", &cell_w.to_string())
+                .replace("%h", &cell_h.to_string())
+                .replace("%b", bg)
+                .replace("%i", &image_id.to_string())
+                .replace("%t", if tmux { "--tmux" } else { "" })
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// The image id in the first kitty graphics command of a renderer's output
+/// (`ESC _G …,i=N,…;`), or `None` if it sent no kitty graphics (sixel, iTerm2).
+/// Inside tmux passthrough the ESC is doubled, which still contains `ESC _G`.
+/// The transmit opens the output, so only the head is searched — a multi-MB
+/// sixel would otherwise be scanned end to end for nothing.
+fn kitty_image_id(bytes: &[u8]) -> Option<u32> {
+    let head = &bytes[..bytes.len().min(4096)];
+    let start = head.windows(3).position(|w| w == b"\x1b_G")? + 3;
+    let controls = &head[start..];
+    let end = controls.iter().position(|&b| b == b';' || b == 0x1b).unwrap_or(controls.len());
+    std::str::from_utf8(&controls[..end])
+        .ok()?
+        .split(',')
+        .find_map(|kv| kv.strip_prefix("i="))
+        .and_then(|v| v.parse().ok())
+        .filter(|&id| id != 0)
+}
+
+/// Cross-process lock serializing kitty graphics from every rustranger that
+/// shares this tmux server's outer terminal.
+///
+/// Kitty sends an image in ≤4 KB chunks, and the spec requires that "the client
+/// must finish sending all chunks for a single image before sending any other
+/// graphics related escape codes". Each pane's passthrough reaches the one outer
+/// terminal, so two panes rendering at once (a tmux resize re-renders them all)
+/// interleave their chunks and corrupt both images. Holding this while writing —
+/// and until tmux has read every byte (see [`drain`]) — keeps each image's chunks
+/// contiguous on the wire. It costs one uncontended `flock`; the kernel drops it
+/// if we die holding it.
+fn gfx_lock_file() -> Option<&'static std::fs::File> {
+    static FILE: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        use std::os::unix::fs::OpenOptionsExt;
+        // SAFETY: getuid(2) cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let path = std::env::temp_dir().join(format!("rustranger-{uid}-gfx.lock"));
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .ok()
+    })
+    .as_ref()
+}
+
+/// How long to wait for another pane to finish sending its image before sending
+/// ours anyway. A transfer takes milliseconds; this only bounds a pane that is
+/// wedged mid-write, which must cost us a glitch, never the UI thread.
+const GFX_LOCK_WAIT: Duration = Duration::from_millis(250);
+
+/// Holds the graphics lock until dropped.
+struct GfxLock(Option<&'static std::fs::File>);
+
+impl GfxLock {
+    fn acquire() -> GfxLock {
+        use std::os::fd::AsRawFd;
+        let Some(file) = gfx_lock_file() else {
+            return GfxLock(None);
+        };
+        let deadline = Instant::now() + GFX_LOCK_WAIT;
+        loop {
+            // SAFETY: flock(2) on a file we keep open for the process lifetime.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return GfxLock(Some(file));
+            }
+            if Instant::now() >= deadline {
+                return GfxLock(None); // proceed unlocked: today's behavior
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+impl Drop for GfxLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        if let Some(file) = self.0 {
+            // SAFETY: as in `acquire`.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+/// Write graphics escapes to the terminal. With `serialize` (kitty through tmux)
+/// it holds the graphics lock until tmux has read all of it — tmux forwards
+/// passthrough as it parses, so everything it has read is already queued for the
+/// outer terminal, in order, ahead of any other pane's next image.
+fn emit(out: &mut impl Write, bytes: &[u8], serialize: bool) -> io::Result<()> {
+    let _lock = serialize.then(GfxLock::acquire);
+    out.write_all(bytes)?;
+    out.flush()?;
+    if serialize {
+        drain(libc::STDOUT_FILENO, GFX_LOCK_WAIT);
+    }
+    Ok(())
+}
+
+/// Wait (bounded) until the tty's output queue is empty, i.e. the pty's reader
+/// — tmux — has taken every byte we wrote. Not `tcdrain(3)`: that has no
+/// timeout, and a tmux that stopped reading would hang us with it.
+fn drain(fd: libc::c_int, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    loop {
+        let mut queued: libc::c_int = 0;
+        // SAFETY: TIOCOUTQ writes one c_int; a non-tty fd just fails.
+        if unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut queued) } != 0
+            || queued <= 0
+            || Instant::now() >= deadline
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// How a renderer run ended.
@@ -897,7 +1066,130 @@ mod tests {
     use crossterm::style::Color;
 
     fn shown(rect: Rect, sixel: bool) -> Shown {
-        Shown { path: PathBuf::from("/img.png"), rect, sixel, tmux: false, bg: Color::Reset }
+        let kitty_id = (!sixel).then_some(4242);
+        Shown { path: PathBuf::from("/img.png"), rect, sixel, tmux: false, kitty_id, bg: Color::Reset }
+    }
+
+    /// The id every instance used to share is what made all tmux panes show
+    /// the same (mis-cut) picture; each instance's must be its own.
+    #[test]
+    fn image_ids_are_per_process_and_fit_a_placeholder() {
+        assert_eq!(image_id_for_pid(1234), 1234, "the pid itself, while it fits");
+        assert_ne!(image_id_for_pid(1234), image_id_for_pid(1235));
+        for pid in [1, 99_999, (1 << 22) - 1, u32::MAX, 0x0100_0000] {
+            let id = image_id_for_pid(pid);
+            assert!((1..=0xFF_FFFF).contains(&id), "pid {pid} -> {id:#x}");
+            assert!(!FOLIO_IMAGE_IDS.contains(&id));
+        }
+        // Never folio's own ids, never 0 ("no id").
+        assert!(!FOLIO_IMAGE_IDS.contains(&image_id_for_pid(0x0070_6466)));
+        assert!(!FOLIO_IMAGE_IDS.contains(&image_id_for_pid(0x0070_6467)));
+        assert_eq!(image_id_for_pid(0x0100_0000), 1);
+        assert_eq!(instance_image_id(), image_id_for_pid(std::process::id()));
+    }
+
+    #[test]
+    fn kitty_id_is_read_back_from_the_renderer_output() {
+        // Direct: cursor move, then the transmit.
+        let direct = b"\x1b[3;5H\x1b_Ga=T,f=100,i=4242,c=10,r=4,C=1,q=2,m=1;iVBOR\x1b\\";
+        assert_eq!(kitty_image_id(direct), Some(4242));
+        // tmux passthrough doubles the ESC.
+        let tmux = b"\x1bPtmux;\x1b\x1b_Ga=T,U=1,f=100,i=7365734,c=10,r=4,q=2,m=1;iVBOR";
+        assert_eq!(kitty_image_id(tmux), Some(7_365_734));
+        // A bare chunk with no payload separator still parses.
+        assert_eq!(kitty_image_id(b"\x1b_Gi=9,a=T\x1b\\"), Some(9));
+        // Not kitty: sixel and iTerm2 output, and nothing at all.
+        assert_eq!(kitty_image_id(b"\x1bPq\"1;1;10;10#0;2;0;0;0~-\x1b\\"), None);
+        assert_eq!(kitty_image_id(b"\x1b]1337;File=inline=1:iVBOR\x07"), None);
+        assert_eq!(kitty_image_id(b""), None);
+        // No id, or the "no id" id, is no id.
+        assert_eq!(kitty_image_id(b"\x1b_Ga=T,f=100;iVBOR"), None);
+        assert_eq!(kitty_image_id(b"\x1b_Ga=T,i=0;iVBOR"), None);
+    }
+
+    /// Clearing must delete only the image this instance drew, so another
+    /// pane's preview survives — and must not send kitty commands at all after
+    /// a sixel/iTerm2 image.
+    #[test]
+    fn clear_deletes_only_its_own_kitty_image() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut kitty = ImagePreview::new();
+        kitty.shown = Some(shown((0, 0, 4, 4), false));
+        kitty.clear(&mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\x1b_Ga=d,d=I,i=4242\x1b\\"), "{text:?}");
+        assert!(!text.contains("i=7365734"), "must not touch the shared legacy id");
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut sixel = ImagePreview::new();
+        sixel.shown = Some(shown((0, 0, 4, 4), true));
+        sixel.clear(&mut out).unwrap();
+        assert!(!String::from_utf8_lossy(&out).contains("\x1b_G"), "no kitty command for sixel");
+    }
+
+    #[test]
+    fn template_gets_the_image_id() {
+        let argv = renderer_argv(
+            "r --id %i --p %p %t %f",
+            Path::new("/a b.png"),
+            (1, 2, 3, 4),
+            "kitty",
+            9,
+            18,
+            false,
+            "none",
+            4242,
+        );
+        assert_eq!(argv, ["r", "--id", "4242", "--p", "kitty", "/a b.png"]);
+    }
+
+    /// The renderer must see our id even when its template has no `%i` —
+    /// that is every config written before this existed.
+    #[test]
+    fn renderer_env_carries_the_image_id() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = std::env::temp_dir().join(format!("rr-env-{}.sh", std::process::id()));
+        std::fs::write(&script, "#!/bin/sh\nprintf %s \"$FOLIO_IMAGE_ID\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tmpl = format!("{} %f", script.display());
+        let out = run_renderer(
+            &tmpl,
+            Path::new("/x.png"),
+            (0, 0, 1, 1),
+            "kitty",
+            8,
+            16,
+            false,
+            "none",
+            4242,
+            &AtomicBool::new(false),
+        );
+        let _ = std::fs::remove_file(&script);
+        assert_eq!(out.unwrap(), b"4242");
+    }
+
+    /// While one instance holds the graphics lock, another waits for it — and
+    /// gives up after GFX_LOCK_WAIT rather than hanging.
+    #[test]
+    fn graphics_lock_serializes_and_is_bounded() {
+        use std::os::fd::AsRawFd;
+        let held = GfxLock::acquire();
+        assert!(held.0.is_some(), "uncontended lock is taken");
+        // A second open file description contends like another process would.
+        let path = std::env::temp_dir().join(format!("rustranger-{}-gfx.lock", unsafe { libc::getuid() }));
+        let other = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let busy = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(busy, -1, "a second holder must be refused while the lock is held");
+        drop(held);
+        let free = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(free, 0, "released on drop");
+
+        // Now *other* holds it: acquire must give up in bounded time.
+        let started = Instant::now();
+        let gave_up = GfxLock::acquire();
+        assert!(gave_up.0.is_none(), "should proceed unlocked");
+        assert!(started.elapsed() >= GFX_LOCK_WAIT && started.elapsed() < Duration::from_secs(2));
+        unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_UN) };
     }
 
     #[test]

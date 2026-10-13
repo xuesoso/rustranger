@@ -407,6 +407,8 @@ theme = \"default\"              # default|gruvbox-dark|gruvbox-light|solarized-
 #   %w cell-width-px  %h cell-height-px  %t (expands to --tmux inside tmux)
 #   %b theme background as RRGGBB (or \"none\" for terminal-default themes) —
 #      folio fills the preview box with it so the box matches the UI theme
+#   %i this instance's kitty image id (also exported as $FOLIO_IMAGE_ID, which
+#      folio reads, so tmux panes each keep their own image)
 # preview_protocol = \"auto\"   # auto (default) | kitty | sixel | iterm
 #                              # In tmux, auto asks the tmux server which client is
 #                              # attached now: Ghostty/kitty -> kitty, WezTerm ->

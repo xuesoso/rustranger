@@ -195,11 +195,17 @@ jpeg = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-w
 ```
 
 Placeholders the command receives: `%f` file, `%p` protocol, `%x`/`%y` box
-top-left cell, `%c`/`%r` box size (cells), `%w`/`%h` cell size (pixels), `%b` the theme background as RRGGBB, and `%t`
-(expands to `--tmux` inside tmux). Anything else in the command is passed through
+top-left cell, `%c`/`%r` box size (cells), `%w`/`%h` cell size (pixels), `%b` the theme background as RRGGBB, `%i`
+this instance's kitty image id, and `%t` (expands to `--tmux` inside tmux). Anything else in the command is passed through
 verbatim, so you can add renderer options — e.g. `folio print … --theme nord
 --sharpness full …`. Needs a kitty-graphics terminal (Ghostty/kitty/WezTerm) or a
 sixel terminal; inside **tmux**, set `allow-passthrough on`.
+
+Several rustranger instances can preview images at once (e.g. side-by-side tmux
+panes): each transmits under its own kitty image id — exported to the renderer as
+`$FOLIO_IMAGE_ID` (folio ≥ 0.6.1 honors it, no config change needed) and as `%i`
+for other renderers — and kitty transfers from different panes are serialized so
+their chunks never interleave on the shared outer terminal.
 
 The render runs on a **background thread** and appears after a short pause, so
 cursor navigation and file operations never block on it; it clears when you move
