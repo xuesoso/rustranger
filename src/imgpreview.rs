@@ -36,16 +36,16 @@ const FOLIO_IMAGE_IDS: [u32; 2] = [0x0070_6466, 0x0070_6467];
 /// one — so instances sharing a fixed id all point their placeholder cells at a
 /// single image: every pane shows whichever preview was sent last, cut to the
 /// wrong cell grid, and one pane's clear deletes the others' pictures. Our pid
-/// is unique among the processes on this host and needs no coordination. It
-/// fits the 24 bits a placeholder's foreground color can carry (pids top out
-/// at 2^22 on Linux, under 100k on macOS); the mask and fix-ups only guard
-/// against a platform where that doesn't hold.
+/// is unique among the processes on this host and needs no coordination. It is
+/// kept below 2^22 (pids top out there on Linux, under 100k on macOS) because
+/// folio's own viewer takes its ids from 2^22 up — the two never collide — and
+/// all of it fits the 24 bits a placeholder's foreground color can carry.
 pub fn instance_image_id() -> u32 {
     image_id_for_pid(std::process::id())
 }
 
 fn image_id_for_pid(pid: u32) -> u32 {
-    let mut id = pid & 0x00FF_FFFF;
+    let mut id = pid & 0x003F_FFFF;
     if FOLIO_IMAGE_IDS.contains(&id) {
         id ^= 0x0080_0000;
     }
@@ -233,6 +233,9 @@ pub struct ImagePreview {
     /// When a render was last skipped for want of an attached tmux client, so the
     /// skip can lapse instead of lasting until the next keypress.
     detached_at: Option<Instant>,
+    /// A kitty image `forget` dropped without deleting: its id, and whether it
+    /// went through tmux. Deleted on the next `sync`/`clear`.
+    stale_kitty: Option<(u32, bool)>,
 }
 
 /// Kill any renderer still running when the preview manager goes away — that is,
@@ -267,8 +270,18 @@ impl ImagePreview {
     /// Forget the displayed image without emitting anything (the real screen was
     /// wiped by a resize or a suspended full-screen child). Any in-flight render
     /// is abandoned; the next `sync` starts fresh.
+    ///
+    /// Wiping the screen erases sixel pixels and placeholder cells, but not a
+    /// kitty image: that lives in the terminal's image store, with its virtual
+    /// placement sized for the *old* box. Ghostty (1.3.1) keeps that placement
+    /// when the id is re-transmitted and picks an arbitrary one per image for
+    /// placeholder cells — so after a resize (e.g. tmux zoom) the new image
+    /// could be fitted to the old grid, cropped wrong until enough re-renders
+    /// shuffled the choice. The id is kept so the next `sync` deletes it.
     pub fn forget(&mut self) {
-        self.shown = None;
+        if let Some(Shown { kitty_id: Some(id), tmux, .. }) = self.shown.take() {
+            self.stale_kitty = Some((id, tmux));
+        }
         self.pending = None;
         self.inflight = None; // drop the receiver; the thread finishes, ignored
         self.attempted = None;
@@ -290,6 +303,7 @@ impl ImagePreview {
         rows: usize,
     ) -> io::Result<SyncOutcome> {
         let mut res = SyncOutcome::default();
+        self.delete_stale(out)?;
         let desired = self.desired(app, cols, rows);
 
         // 1. Collect a finished background render and display it — but only if it
@@ -384,6 +398,7 @@ impl ImagePreview {
         use crossterm::cursor::MoveTo;
         use crossterm::style::{Print, ResetColor, SetBackgroundColor};
 
+        self.delete_stale(out)?;
         let Some(s) = self.shown.take() else {
             return Ok(None);
         };
@@ -410,6 +425,16 @@ impl ImagePreview {
         // Sixel/iterm pixels may survive cell overwrites on some terminals; keep
         // the full repaint as the reliable eraser there. Kitty needs none.
         Ok(Some((s.rect, s.sixel)))
+    }
+
+    /// Delete the kitty image a `forget` left in the terminal, if any. Nothing is
+    /// on screen to blank — the wipe that prompted `forget` already did that.
+    fn delete_stale(&mut self, out: &mut impl Write) -> io::Result<()> {
+        if let Some((id, tmux)) = self.stale_kitty.take() {
+            let del = format!("\x1b_Ga=d,d=I,i={id}\x1b\\");
+            emit(out, &maybe_tmux(del.as_bytes(), tmux), tmux)?;
+        }
+        Ok(())
     }
 
     /// Which image (path + preview-box rect) should be showing right now, if any.
@@ -719,7 +744,9 @@ fn drain(fd: libc::c_int, limit: Duration) {
         {
             return;
         }
-        thread::sleep(Duration::from_millis(1));
+        // tmux takes ~0.1 ms to read what we just wrote; a coarser sleep would
+        // round every image up to a whole tick of UI-thread stall.
+        thread::sleep(Duration::from_micros(100));
     }
 }
 
@@ -1065,6 +1092,11 @@ mod tests {
     use super::*;
     use crossterm::style::Color;
 
+    /// Tests that take the graphics lock share the process's one lock file
+    /// handle, so one test's unlock would release another's hold: take turns.
+    /// (The app itself only ever takes it from the UI thread.)
+    static GFX_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn shown(rect: Rect, sixel: bool) -> Shown {
         let kitty_id = (!sixel).then_some(4242);
         Shown { path: PathBuf::from("/img.png"), rect, sixel, tmux: false, kitty_id, bg: Color::Reset }
@@ -1078,7 +1110,7 @@ mod tests {
         assert_ne!(image_id_for_pid(1234), image_id_for_pid(1235));
         for pid in [1, 99_999, (1 << 22) - 1, u32::MAX, 0x0100_0000] {
             let id = image_id_for_pid(pid);
-            assert!((1..=0xFF_FFFF).contains(&id), "pid {pid} -> {id:#x}");
+            assert!((1..1 << 22).contains(&id), "pid {pid} -> {id:#x}: below folio's viewer ids");
             assert!(!FOLIO_IMAGE_IDS.contains(&id));
         }
         // Never folio's own ids, never 0 ("no id").
@@ -1127,6 +1159,50 @@ mod tests {
         assert!(!String::from_utf8_lossy(&out).contains("\x1b_G"), "no kitty command for sixel");
     }
 
+    /// A resize wipes the screen but not the terminal's kitty image store, so
+    /// the image `forget` drops must still be deleted — else its stale virtual
+    /// placement (sized for the old box) can be picked for the next image.
+    #[test]
+    fn forget_defers_the_kitty_delete_to_the_next_emit() {
+        let mut ip = ImagePreview::new();
+        ip.shown = Some(shown((0, 0, 4, 4), false));
+        ip.forget();
+        assert!(ip.shown.is_none());
+
+        let mut out: Vec<u8> = Vec::new();
+        // Nothing is shown any more, so there is no box to blank or report...
+        assert_eq!(ip.clear(&mut out).unwrap(), None);
+        // ...but the image itself is deleted, once.
+        assert_eq!(String::from_utf8_lossy(&out), "\x1b_Ga=d,d=I,i=4242\x1b\\");
+        out.clear();
+        ip.clear(&mut out).unwrap();
+        assert!(out.is_empty(), "deleted only once");
+    }
+
+    #[test]
+    fn forget_wraps_the_deferred_delete_for_tmux() {
+        let _turn = GFX_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ip = ImagePreview::new();
+        let mut s = shown((0, 0, 4, 4), false);
+        s.tmux = true;
+        ip.shown = Some(s);
+        ip.forget();
+        let mut out: Vec<u8> = Vec::new();
+        ip.delete_stale(&mut out).unwrap();
+        assert_eq!(out, b"\x1bPtmux;\x1b\x1b_Ga=d,d=I,i=4242\x1b\x1b\\\x1b\\");
+    }
+
+    /// Sixel pixels are erased by the wipe itself: nothing to delete later.
+    #[test]
+    fn forget_leaves_nothing_to_delete_after_sixel() {
+        let mut ip = ImagePreview::new();
+        ip.shown = Some(shown((0, 0, 4, 4), true));
+        ip.forget();
+        let mut out: Vec<u8> = Vec::new();
+        ip.clear(&mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
     #[test]
     fn template_gets_the_image_id() {
         let argv = renderer_argv(
@@ -1172,6 +1248,7 @@ mod tests {
     /// gives up after GFX_LOCK_WAIT rather than hanging.
     #[test]
     fn graphics_lock_serializes_and_is_bounded() {
+        let _turn = GFX_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::fd::AsRawFd;
         let held = GfxLock::acquire();
         assert!(held.0.is_some(), "uncontended lock is taken");
