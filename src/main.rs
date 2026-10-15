@@ -825,12 +825,14 @@ fn handle_key(app: &mut App, key: KeyEvent, pending: &mut Option<char>, count: &
                     'y' => app.copy(),
                     'n' => app.yank_name(true),  // name with extension
                     'b' => app.yank_name(false), // base name, no extension
+                    'p' => app.yank_path(),
                     _ => {}
                 },
                 // Toggle settings (ranger's `z` prefix).
                 'z' => match c {
                     'h' => app.toggle_hidden(),
                     'i' => app.toggle_preview_images(),
+                    'I' => app.toggle_preview_theme(),
                     'm' => app.toggle_mouse(),
                     _ => {}
                 },

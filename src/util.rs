@@ -170,21 +170,34 @@ unsafe fn cstr_to_string(ptr: *const libc::c_char) -> Option<String> {
 /// "YYYY/MM/DD", or "YYYY/MM/DD/HH/MM" when `with_time` is set. Uses libc's
 /// `localtime_r` so the local timezone and DST are applied (no chrono dependency).
 pub fn format_time(secs: i64, with_time: bool) -> String {
+    let Some(tm) = local_tm(secs) else {
+        return String::new();
+    };
+    let (year, month, day) = (tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    if with_time {
+        format!(
+            "{:04}/{:02}/{:02}/{:02}/{:02}",
+            year, month, day, tm.tm_hour, tm.tm_min
+        )
+    } else {
+        format!("{:04}/{:02}/{:02}", year, month, day)
+    }
+}
+
+/// Format a unix timestamp as a "YYYY-MM-DD" local date (the status bar's
+/// modification date).
+pub fn format_date_iso(secs: i64) -> String {
+    let Some(tm) = local_tm(secs) else {
+        return String::new();
+    };
+    format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)
+}
+
+fn local_tm(secs: i64) -> Option<libc::tm> {
     unsafe {
         let t = secs as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&t, &mut tm).is_null() {
-            return String::new();
-        }
-        let (year, month, day) = (tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-        if with_time {
-            format!(
-                "{:04}/{:02}/{:02}/{:02}/{:02}",
-                year, month, day, tm.tm_hour, tm.tm_min
-            )
-        } else {
-            format!("{:04}/{:02}/{:02}", year, month, day)
-        }
+        (!libc::localtime_r(&t, &mut tm).is_null()).then_some(tm)
     }
 }
 

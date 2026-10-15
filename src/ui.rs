@@ -196,6 +196,7 @@ const HELP: &[&str] = &[
     "File operations",
     "  yy                copy selection",
     "  yn / yb           copy name / base name (no ext) to clipboard",
+    "  yp                copy full path to clipboard",
     "  dd                cut selection",
     "  pp                paste",
     "  pl / pL           paste symlink (relative / absolute)",
@@ -232,6 +233,7 @@ const HELP: &[&str] = &[
     "View, search & console",
     "  zh                toggle hidden files",
     "  zi                toggle image/document preview",
+    "  zI                toggle image preview color inversion",
     "  zm                toggle mouse support",
     "  / , n / N         search, next / previous match",
     "  :                 command console (mkdir, touch, chmod, filter, set, …)",
@@ -673,11 +675,12 @@ fn draw_statusbar(buf: &mut Buffer, app: &App, y: usize, cols: usize, t: &Theme)
             String::new()
         };
         format!(
-            "{} {} {} {}{}",
+            "{} {} {} {} {}{}",
             util::permission_string(entry.mode),
             util::username(entry.uid),
             util::groupname(entry.gid),
             format_size(entry.size, &app.settings),
+            util::format_date_iso(entry.mtime),
             link,
         )
     } else {

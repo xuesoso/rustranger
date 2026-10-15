@@ -54,6 +54,7 @@ is opt-in through a configured external renderer — see below.)
 | `Ctrl-d`/`Ctrl-u` | half-page down/up | `uv` | clear marks |
 | `J`/`K` | scroll preview | `yy` | copy |
 | `zh` / `zi` / `zm` | toggle hidden / image preview / mouse | `dd` | cut |
+| `zI` | toggle image preview color inversion | `yp` | copy full path to clipboard |
 | `yn` / `yb` | copy name / base name (no ext) to clipboard | | |
 | `gh` / `g/` | home / root dir | `pp` | paste |
 | `H` / `L` | history back / forward | `pl` / `pL` | paste symlink (rel/abs) |
@@ -186,19 +187,22 @@ preview_protocol = "auto"    # auto (default) | kitty | sixel | iterm.
                              # else (incl. iTerm2) → tmux-native sixel. Outside
                              # tmux: kitty on Ghostty/kitty/WezTerm, iterm (OSC
                              # 1337) on iTerm2/VSCode, sixel elsewhere.
+preview_theme = "off"        # off | nord (color-inverted) | auto (nord when the
+                             # theme background is dark). Passed as %m; toggle
+                             # with zI, which saves it back to this file.
 
 [preview]
-pdf  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f"
-png  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f"
-jpg  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f"
-jpeg = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f"
+pdf  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b --theme %m %t %f"
+png  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b --theme %m %t %f"
+jpg  = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b --theme %m %t %f"
+jpeg = "folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b --theme %m %t %f"
 ```
 
 Placeholders the command receives: `%f` file, `%p` protocol, `%x`/`%y` box
-top-left cell, `%c`/`%r` box size (cells), `%w`/`%h` cell size (pixels), `%b` the theme background as RRGGBB, `%i`
-this instance's kitty image id, and `%t` (expands to `--tmux` inside tmux). Anything else in the command is passed through
-verbatim, so you can add renderer options — e.g. `folio print … --theme nord
---sharpness full …`. Needs a kitty-graphics terminal (Ghostty/kitty/WezTerm) or a
+top-left cell, `%c`/`%r` box size (cells), `%w`/`%h` cell size (pixels), `%b` the theme background as RRGGBB, `%m`
+the image color theme (`preview_theme`), `%i` this instance's kitty image id, and `%t` (expands to `--tmux` inside tmux). Anything else in the command is passed through
+verbatim, so you can add renderer options — e.g. `folio print … --sharpness full …`.
+A command that hardcodes `--theme` instead of `--theme %m` won't follow `zI`. Needs a kitty-graphics terminal (Ghostty/kitty/WezTerm) or a
 sixel terminal; inside **tmux**, set `allow-passthrough on`.
 
 Several rustranger instances can preview images at once (e.g. side-by-side tmux

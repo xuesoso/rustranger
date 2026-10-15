@@ -470,13 +470,14 @@ impl ImagePreview {
         let (cell_w, cell_h) = cell_pixel_size();
         let tmux = in_tmux();
         let bg = theme_bg_hex(app);
+        let theme = app.settings.preview_theme.name();
         let id = instance_image_id();
         let (tx, rx) = mpsc::channel();
         let p = path.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancel);
         thread::spawn(move || {
-            let _ = tx.send(run_renderer(&tmpl, &p, rect, proto, cell_w, cell_h, tmux, &bg, id, &flag));
+            let _ = tx.send(run_renderer(&tmpl, &p, rect, proto, cell_w, cell_h, tmux, &bg, theme, id, &flag));
         });
         // Assigning replaces any previous Inflight, whose CancelOnDrop stops the
         // render it stood for — so a burst of navigation leaves one renderer
@@ -504,10 +505,11 @@ fn run_renderer(
     cell_h: u16,
     tmux: bool,
     bg: &str,
+    theme: &str,
     image_id: u32,
     cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
-    let argv = renderer_argv(template, path, rect, proto, cell_w, cell_h, tmux, bg, image_id);
+    let argv = renderer_argv(template, path, rect, proto, cell_w, cell_h, tmux, bg, theme, image_id);
     let Some((prog, args)) = argv.split_first() else {
         return Err("empty preview command".to_string());
     };
@@ -606,6 +608,7 @@ fn renderer_argv(
     cell_h: u16,
     tmux: bool,
     bg: &str,
+    theme: &str,
     image_id: u32,
 ) -> Vec<String> {
     let (x, y, c, r) = rect;
@@ -624,6 +627,7 @@ fn renderer_argv(
                 .replace("%w", &cell_w.to_string())
                 .replace("%h", &cell_h.to_string())
                 .replace("%b", bg)
+                .replace("%m", theme)
                 .replace("%i", &image_id.to_string())
                 .replace("%t", if tmux { "--tmux" } else { "" })
         })
@@ -1206,7 +1210,7 @@ mod tests {
     #[test]
     fn template_gets_the_image_id() {
         let argv = renderer_argv(
-            "r --id %i --p %p %t %f",
+            "r --id %i --p %p --theme %m %t %f",
             Path::new("/a b.png"),
             (1, 2, 3, 4),
             "kitty",
@@ -1214,9 +1218,10 @@ mod tests {
             18,
             false,
             "none",
+            "nord",
             4242,
         );
-        assert_eq!(argv, ["r", "--id", "4242", "--p", "kitty", "/a b.png"]);
+        assert_eq!(argv, ["r", "--id", "4242", "--p", "kitty", "--theme", "nord", "/a b.png"]);
     }
 
     /// The renderer must see our id even when its template has no `%i` —
@@ -1237,6 +1242,7 @@ mod tests {
             16,
             false,
             "none",
+            "off",
             4242,
             &AtomicBool::new(false),
         );

@@ -110,6 +110,7 @@ impl KeyMenu {
                 ("y", "copy selection (files)"),
                 ("n", "copy name to clipboard"),
                 ("b", "copy base name, no extension"),
+                ("p", "copy full path name"),
             ],
         )
     }
@@ -144,6 +145,7 @@ impl KeyMenu {
             &[
                 ("h", "hidden files"),
                 ("i", "image/document preview"),
+                ("I", "image color inversion"),
                 ("m", "mouse support"),
             ],
         )
@@ -620,6 +622,36 @@ impl App {
         }
     }
 
+    /// Toggle color inversion of image previews (`zI`): flips the theme fed to
+    /// the renderer as `%m` between `nord` (inverted) and `off`, starting from
+    /// what `auto` currently resolves to, and persists it like the other `z`
+    /// toggles. No explicit re-render is needed: the `z` menu overlay already
+    /// cleared the image, so it is drawn afresh with the new theme.
+    pub fn toggle_preview_theme(&mut self) {
+        use crate::config::PreviewTheme;
+        let inverted = match self.settings.preview_theme {
+            PreviewTheme::Nord => true,
+            PreviewTheme::Off => false,
+            PreviewTheme::Auto => bg_is_dark(self.settings.theme.bg),
+        };
+        let theme = if inverted { PreviewTheme::Off } else { PreviewTheme::Nord };
+        self.settings.preview_theme = theme;
+        let state = if inverted { "off" } else { "on" };
+        // A command that hardcodes `--theme` instead of using `%m` ignores this.
+        let hint = if self.settings.preview_cmds.iter().any(|(_, c)| c.contains("%m")) {
+            ""
+        } else {
+            " — no [preview] command uses %m, so renders are unchanged"
+        };
+        match crate::config::persist_setting("preview_theme", theme.name()) {
+            Ok(()) => self.message = Some(format!("image color inversion: {state}{hint}")),
+            Err(e) => {
+                self.message =
+                    Some(format!("image color inversion: {state} (couldn't save: {e}){hint}"))
+            }
+        }
+    }
+
     pub fn set_sort(&mut self, key: SortKey) {
         self.settings.sort = key;
         self.message = Some(format!("sort: {}", key.name()));
@@ -694,6 +726,18 @@ impl App {
         };
         self.message = Some(match crate::clipboard::copy(&name) {
             Ok(()) => format!("copied to clipboard: {}", name),
+            Err(e) => format!("clipboard error: {}", e),
+        });
+    }
+
+    /// Copy the focused entry's full (absolute) path to the system clipboard.
+    pub fn yank_path(&mut self) {
+        let Some(path) = self.selected_path() else {
+            return;
+        };
+        let path = path.to_string_lossy().into_owned();
+        self.message = Some(match crate::clipboard::copy(&path) {
+            Ok(()) => format!("copied to clipboard: {}", path),
             Err(e) => format!("clipboard error: {}", e),
         });
     }
@@ -1251,9 +1295,28 @@ impl App {
                         Some(format!("unknown theme '{}' ({})", value, crate::theme::Theme::names()))
                 }
             },
+            "preview_theme" => match crate::config::PreviewTheme::from_str(value) {
+                Some(t) => self.settings.preview_theme = t,
+                None => self.message = Some("preview_theme: expected off|nord|auto".to_string()),
+            },
             other => self.message = Some(format!("set: unknown option {}", other)),
         }
     }
+}
+
+/// Whether a theme background is dark — the rule folio's `--theme auto` uses
+/// (relative luminance below 0.5), so `zI` can tell what `auto` is showing.
+/// Non-RGB backgrounds (the terminal's own) are passed to folio as `none`,
+/// which `auto` treats as light.
+fn bg_is_dark(bg: crossterm::style::Color) -> bool {
+    let crossterm::style::Color::Rgb { r, g, b } = bg else {
+        return false;
+    };
+    let chan = |c: u8| {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b) < 0.5
 }
 
 #[cfg(test)]
@@ -1400,6 +1463,16 @@ mod tests {
         assert!(msg.contains("failed"), "got message: {:?}", msg);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `zI` reads what `auto` shows using folio's rule: dark RGB backgrounds
+    /// invert, light ones and the terminal's own background don't.
+    #[test]
+    fn bg_is_dark_matches_folio_auto() {
+        use crossterm::style::Color;
+        assert!(bg_is_dark(Color::Rgb { r: 0x28, g: 0x28, b: 0x28 }));
+        assert!(!bg_is_dark(Color::Rgb { r: 0xfb, g: 0xf1, b: 0xc7 }));
+        assert!(!bg_is_dark(Color::Reset));
     }
 
     /// Long sessions must not grow the caches without bound; the cwd (and other

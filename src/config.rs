@@ -122,6 +122,10 @@ pub struct Settings {
     pub preview_cmds: Vec<(String, String)>,
     /// Terminal graphics protocol used for image previews.
     pub preview_protocol: PreviewProtocol,
+    /// Color theme handed to the image renderer through the `%m` placeholder
+    /// (folio's `--theme`): `nord` inverts the image into a dark reading mode.
+    /// Toggled at runtime (`zI`) and persisted back to the config file.
+    pub preview_theme: PreviewTheme,
 }
 
 /// Terminal graphics protocol for image previews.
@@ -145,6 +149,37 @@ impl PreviewProtocol {
             "sixel" => Some(PreviewProtocol::Sixel),
             "iterm" | "iterm2" => Some(PreviewProtocol::Iterm),
             _ => None,
+        }
+    }
+}
+
+/// Color theme for image previews, passed verbatim to the renderer as `%m` —
+/// the values are folio's `--theme` names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PreviewTheme {
+    /// Original colors.
+    Off,
+    /// Color-inverted (folio's Nord dark mode).
+    Nord,
+    /// Let the renderer decide: inverted when the theme background is dark.
+    Auto,
+}
+
+impl PreviewTheme {
+    pub fn from_str(s: &str) -> Option<PreviewTheme> {
+        match s {
+            "off" | "none" | "normal" | "false" => Some(PreviewTheme::Off),
+            "nord" | "dark" | "invert" | "inverted" | "true" => Some(PreviewTheme::Nord),
+            "auto" => Some(PreviewTheme::Auto),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PreviewTheme::Off => "off",
+            PreviewTheme::Nord => "nord",
+            PreviewTheme::Auto => "auto",
         }
     }
 }
@@ -278,6 +313,11 @@ impl Settings {
                     self.preview_protocol = p;
                 }
             }
+            "preview_theme" => {
+                if let Some(t) = PreviewTheme::from_str(value) {
+                    self.preview_theme = t;
+                }
+            }
             "confirm_on_delete" => self.confirm_on_delete = as_bool(value),
             "wrap_scroll" => self.wrap_scroll = as_bool(value),
             "mouse_enabled" => self.mouse_enabled = as_bool(value),
@@ -409,17 +449,21 @@ theme = \"default\"              # default|gruvbox-dark|gruvbox-light|solarized-
 #      folio fills the preview box with it so the box matches the UI theme
 #   %i this instance's kitty image id (also exported as $FOLIO_IMAGE_ID, which
 #      folio reads, so tmux panes each keep their own image)
+#   %m image color theme from preview_theme below (folio's --theme)
 # preview_protocol = \"auto\"   # auto (default) | kitty | sixel | iterm
 #                              # In tmux, auto asks the tmux server which client is
 #                              # attached now: Ghostty/kitty -> kitty, WezTerm ->
 #                              # iterm, else (incl. iTerm2) -> tmux-native sixel.
 #                              # Outside tmux: kitty on Ghostty/kitty/WezTerm,
 #                              # iterm on iTerm2/VSCode, sixel elsewhere.
+# preview_theme = \"off\"       # off | nord (color-inverted dark mode) | auto
+#                              # (nord when the theme background is dark).
+#                              # Fed to the command as %m. Toggle: zI
 [preview]
-pdf  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f\"
-png  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f\"
-jpg  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f\"
-jpeg = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b %t %f\"
+pdf  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b --theme %m %t %f\"
+png  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b --theme %m %t %f\"
+jpg  = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b --theme %m %t %f\"
+jpeg = \"folio print --protocol %p --col %x --row %y --cols %c --rows %r --cell-width %w --cell-height %h --bg %b --theme %m %t %f\"
 ";
 
 /// Outcome of generating the default config file.
@@ -555,6 +599,7 @@ impl Default for Settings {
             openers: Vec::new(),
             preview_cmds: Vec::new(),
             preview_protocol: PreviewProtocol::Auto,
+            preview_theme: PreviewTheme::Off,
         }
     }
 }
@@ -667,6 +712,24 @@ mod tests {
         s.apply_toml("[open]\ncsv = \"libreoffice --calc &\"\n");
         assert_eq!(find(&s, "csv"), Some("libreoffice --calc &"));
         assert_eq!(s.openers.iter().filter(|(e, _)| e == "csv").count(), 1);
+    }
+
+    #[test]
+    fn preview_theme_parses_with_aliases() {
+        assert_eq!(Settings::default().preview_theme, PreviewTheme::Off);
+        let mut s = Settings::default();
+        s.apply_toml("[settings]\npreview_theme = \"nord\"\n");
+        assert_eq!(s.preview_theme, PreviewTheme::Nord);
+        s.set_field("preview_theme", "auto");
+        assert_eq!(s.preview_theme, PreviewTheme::Auto);
+        s.set_field("preview_theme", "invert");
+        assert_eq!(s.preview_theme, PreviewTheme::Nord);
+        s.set_field("preview_theme", "bogus"); // ignored
+        assert_eq!(s.preview_theme, PreviewTheme::Nord);
+        // The shipped [preview] commands feed it to folio.
+        let mut d = Settings::default();
+        d.apply_toml(DEFAULT_CONFIG);
+        assert!(d.preview_cmds.iter().all(|(_, c)| c.contains("--theme %m")));
     }
 
     #[test]
