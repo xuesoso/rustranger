@@ -92,8 +92,22 @@ pub struct Settings {
     pub time_format: TimeFormat,
     /// How file sizes are rendered (human decimal/binary, or raw bytes).
     pub size_format: SizeFormat,
-    /// Active color theme (resolved palette; see `[theme]` for per-role overrides).
+    /// Active color theme: the palette resolved from `theme_name` (and, for
+    /// `auto`, the terminal background) with the `[theme]` overrides on top.
+    /// Derived — change it through `set_field`/`set_dark_background`.
     pub theme: Theme,
+    /// The configured `theme`: a built-in theme name, or `auto` to follow the
+    /// terminal's background between `light_theme` and `dark_theme`.
+    pub theme_name: String,
+    /// The themes `auto` switches between.
+    pub light_theme: String,
+    pub dark_theme: String,
+    /// Per-role colors from the `[theme]` section, re-applied whenever the base
+    /// theme changes (so they survive an automatic light/dark switch).
+    pub theme_overrides: Vec<(String, crossterm::style::Color)>,
+    /// Whether the terminal background was last seen to be dark. `None` until
+    /// detected, which `auto` treats as dark.
+    pub dark_background: Option<bool>,
     pub confirm_on_delete: bool,
     pub wrap_scroll: bool,
     /// While a full-screen child (editor/pager/TUI) runs, override the terminal's
@@ -200,25 +214,16 @@ impl Settings {
 
     /// Apply a flat, minimal subset of TOML: `key = value` lines under `[settings]`
     /// and per-role color overrides under `[theme]`. Avoids a TOML crate for a flat
-    /// schema. Two passes so a `[theme]` section can override the named `theme`
-    /// regardless of section ordering in the file.
+    /// schema. The palette is resolved once everything is read, so `[theme]`
+    /// overrides layer on top of the named `theme` regardless of section order.
     fn apply_toml(&mut self, text: &str) {
-        // Pass 1: resolve the base theme so [theme] overrides layer on top of it.
-        for (section, key, value) in toml_entries(text) {
-            if section == "settings" && key == "theme" {
-                if let Some(t) = Theme::by_name(value) {
-                    self.theme = t;
-                }
-            }
-        }
-        // Pass 2: all settings (the theme name is already applied) + [theme] roles
-        // + [open] per-extension open commands.
         for (section, key, value) in toml_entries(text) {
             match section {
-                "settings" if key != "theme" => self.set_field(key, value),
+                "settings" => self.set_field(key, value),
                 "theme" => {
                     if let Some(c) = crate::theme::parse_color(value) {
-                        self.theme.set_field(key, c);
+                        self.theme_overrides.retain(|(k, _)| k != key);
+                        self.theme_overrides.push((key.to_string(), c));
                     }
                 }
                 "open" => self.set_opener(key, value),
@@ -226,6 +231,44 @@ impl Settings {
                 _ => {}
             }
         }
+        self.resolve_theme();
+    }
+
+    /// Whether `theme = "auto"` (follow the terminal's background).
+    pub fn theme_auto(&self) -> bool {
+        self.theme_name == "auto"
+    }
+
+    /// The built-in theme in effect: `theme`, or for `auto` the light/dark one
+    /// matching the terminal background (dark until detected).
+    pub fn active_theme_name(&self) -> &str {
+        match (self.theme_auto(), self.dark_background) {
+            (false, _) => &self.theme_name,
+            (true, Some(false)) => &self.light_theme,
+            (true, _) => &self.dark_theme,
+        }
+    }
+
+    /// Rebuild `theme` from the active theme name plus the `[theme]` overrides.
+    fn resolve_theme(&mut self) {
+        let mut theme = Theme::by_name(self.active_theme_name()).unwrap_or_default();
+        for (key, c) in &self.theme_overrides {
+            theme.set_field(key, *c);
+        }
+        self.theme = theme;
+    }
+
+    /// Record the terminal background's darkness (from an `OSC 11` reply). Under
+    /// `auto` this picks the light or dark theme; returns whether the active
+    /// theme changed, i.e. whether the screen needs repainting.
+    pub fn set_dark_background(&mut self, dark: bool) -> bool {
+        let before = self.active_theme_name().to_string();
+        self.dark_background = Some(dark);
+        let changed = self.active_theme_name() != before;
+        if changed {
+            self.resolve_theme();
+        }
+        changed
     }
 
     /// Register a per-extension open command (from the `[open]` section). The
@@ -303,9 +346,16 @@ impl Settings {
                     self.size_format = f;
                 }
             }
-            "theme" => {
-                if let Some(t) = Theme::by_name(value) {
-                    self.theme = t;
+            "theme" | "light_theme" | "dark_theme" => {
+                let name = value.trim().to_ascii_lowercase();
+                let valid = Theme::by_name(&name).is_some() || (key == "theme" && name == "auto");
+                if valid {
+                    match key {
+                        "theme" => self.theme_name = name,
+                        "light_theme" => self.light_theme = name,
+                        _ => self.dark_theme = name,
+                    }
+                    self.resolve_theme();
                 }
             }
             "preview_protocol" => {
@@ -409,12 +459,20 @@ show_date = true               # date column next to the size (current column)
 time_type = \"modified\"         # modified|created|changed|accessed
 time_format = \"date\"           # date (YYYY/MM/DD) | datetime (YYYY/MM/DD/HH/MM)
 size_format = \"human\"          # human (1.5k) | binary (1.5K, 1024-based) | bytes (1536)
-theme = \"default\"              # default|gruvbox-dark|gruvbox-light|solarized-dark|
+theme = \"default\"              # auto|default|gruvbox-dark|gruvbox-light|solarized-dark|
                                # solarized-light|nord|dracula|subliminal|gitlab-dark|
                                # gitlab-light|everforest-dark|everforest-light|
                                # one-light|ayu-light
+                               # auto: follow the terminal's background color —
+                               # light_theme on a light one, dark_theme on a dark
+                               # one — and switch live when it changes (e.g. the
+                               # system appearance flips). Needs a terminal that
+                               # answers OSC 11 (most do; tmux 3.3+ passes it on).
+light_theme = \"gruvbox-light\"  # used by theme = \"auto\" on a light background
+dark_theme = \"gruvbox-dark\"    # used by theme = \"auto\" on a dark background
 
-# Override individual theme roles on top of the chosen theme. Values may be
+# Override individual theme roles on top of the chosen theme (with theme =
+# \"auto\", on top of whichever of light_theme/dark_theme is active). Values may be
 # #rrggbb, a basic color name, an ANSI index 0-255, or \"reset\".
 # Roles: bg fg border title accent dir link exec special device broken
 #        warning error info progress
@@ -591,6 +649,11 @@ impl Default for Settings {
             time_format: TimeFormat::Date,
             size_format: SizeFormat::Human,
             theme: Theme::default(),
+            theme_name: "default".to_string(),
+            light_theme: "gruvbox-light".to_string(),
+            dark_theme: "gruvbox-dark".to_string(),
+            theme_overrides: Vec::new(),
+            dark_background: None,
             confirm_on_delete: true,
             wrap_scroll: false,
             mouse_enabled: true,
@@ -615,6 +678,35 @@ mod tests {
         s.apply_toml("[settings]\ntheme = \"nord\"  # base palette\n\n[theme]\ndir = \"#ff0000\" # red\n");
         assert!(matches!(s.theme.bg, Color::Rgb { r: 46, g: 52, b: 64 }), "nord bg");
         assert!(matches!(s.theme.dir, Color::Rgb { r: 255, g: 0, b: 0 }), "dir override");
+    }
+
+    #[test]
+    fn auto_theme_follows_background_and_keeps_overrides() {
+        let mut s = Settings::default();
+        s.apply_toml(
+            "[settings]\ntheme = \"auto\"\nlight_theme = \"one-light\"\ndark_theme = \"nord\"\n\n[theme]\ndir = \"#ff0000\"\n",
+        );
+        assert!(s.theme_auto());
+        // Undetected: dark.
+        assert_eq!(s.active_theme_name(), "nord");
+        assert!(matches!(s.theme.bg, Color::Rgb { r: 46, g: 52, b: 64 }));
+        // A light background switches to the light theme, overrides intact.
+        assert!(s.set_dark_background(false));
+        assert_eq!(s.active_theme_name(), "one-light");
+        assert!(matches!(s.theme.dir, Color::Rgb { r: 255, g: 0, b: 0 }));
+        // Same answer again: nothing to repaint.
+        assert!(!s.set_dark_background(false));
+        assert!(s.set_dark_background(true));
+        assert!(matches!(s.theme.bg, Color::Rgb { r: 46, g: 52, b: 64 }));
+        // A fixed theme ignores the background.
+        s.set_field("theme", "dracula");
+        assert!(!s.set_dark_background(false));
+        assert!(matches!(s.theme.bg, Color::Rgb { r: 40, g: 42, b: 54 }));
+        // Unknown names are ignored rather than half-applied.
+        s.set_field("light_theme", "nope");
+        assert_eq!(s.light_theme, "one-light");
+        s.set_field("dark_theme", "auto");
+        assert_eq!(s.dark_theme, "nord");
     }
 
     #[test]

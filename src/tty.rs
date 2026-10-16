@@ -21,12 +21,13 @@
 //! lets rustranger outlive its terminal at all.
 //!
 //! The fix is to own the wait ourselves: [`wait`] blocks in `poll(2)` on the
-//! terminal and reports a hangup as a hangup, so crossterm is only ever asked to
-//! read a live fd. [`watch_hangup`] covers the microscopic window between that
-//! check and the read.
+//! terminal and reports a hangup as a hangup, and [`read`] — not crossterm —
+//! takes the bytes, treating end-of-file as the hangup it is (see `input` for
+//! why rustranger decodes its own input). [`watch_hangup`] remains as the
+//! backstop for a main thread stuck anywhere else.
 //!
-//! Owning the wait costs us the `SIGWINCH` wake-up crossterm's own event source
-//! provides, so [`install_resize_wake`] re-adds it through a self-pipe.
+//! Not using crossterm's event source also means not having its `SIGWINCH`
+//! wake-up, so [`install_resize_wake`] provides one through a self-pipe.
 
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -39,17 +40,18 @@ const DEAD: libc::c_short = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
 /// What a [`wait`] ended with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wait {
-    /// Input is available: crossterm can safely read it.
+    /// Input is available: [`read`] will not block.
     Ready,
     /// The window changed size (see [`install_resize_wake`]).
     Resized,
     /// Nothing happened before the timeout.
     Timeout,
-    /// The terminal hung up. Never hand the fd to crossterm again — quit.
+    /// The terminal hung up. Never read the fd again — quit.
     Hangup,
 }
 
-/// The fd crossterm reads events from: stdin when it is a tty, else `/dev/tty`.
+/// The terminal's input fd: stdin when it is a tty, else `/dev/tty` (the same
+/// choice crossterm makes for raw mode).
 /// Opened once and deliberately leaked — it lives as long as the process.
 fn tty_fd() -> Option<RawFd> {
     static FD: OnceLock<Option<RawFd>> = OnceLock::new();
@@ -79,11 +81,9 @@ extern "C" fn on_winch(_sig: libc::c_int) {
 
 /// Make window resizes wake [`wait`], via the classic self-pipe trick.
 ///
-/// This replaces crossterm's own `SIGWINCH` handler, so call it *after* the
-/// crossterm event source exists (one `event::poll` is enough to build it) —
-/// otherwise crossterm's lazy registration would clobber ours instead. Losing
-/// crossterm's handler is harmless here: the run loop re-reads the terminal size
-/// every frame and ignores `Event::Resize`, it just needs to be woken.
+/// The run loop re-reads the terminal size every frame; it just needs to be
+/// woken. (crossterm's event source, which would register a handler of its own,
+/// is never created — see `input`.)
 pub fn install_resize_wake() {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: fds is a valid 2-element array; pipe only writes into it.
@@ -113,9 +113,9 @@ fn drain_winch(fd: RawFd) {
 
 /// Wait up to `timeout` for terminal input, a resize, or a hangup.
 ///
-/// Only [`Wait::Ready`] means crossterm may read. With no terminal to watch
-/// (piped stdin and no `/dev/tty`) this reports `Ready` so the caller falls back
-/// to crossterm's own blocking wait.
+/// Only [`Wait::Ready`] means [`read`] may be called. With no terminal to watch
+/// (piped stdin and no `/dev/tty`) this reports `Ready`, and the `read` that
+/// follows reports the missing terminal as a hangup.
 pub fn wait(timeout: Duration) -> Wait {
     let Some(tty) = tty_fd() else {
         return Wait::Ready;
@@ -134,8 +134,7 @@ pub fn wait(timeout: Duration) -> Wait {
         // re-checks its own quit flags, exactly as a quiet tick would.
         return Wait::Timeout;
     }
-    // A hangup outranks pending input: the bytes are moot, and reading past them
-    // is what wedges crossterm.
+    // A hangup outranks pending input: the bytes are moot.
     if fds[0].revents & DEAD != 0 {
         return Wait::Hangup;
     }
@@ -147,6 +146,39 @@ pub fn wait(timeout: Duration) -> Wait {
         return Wait::Ready;
     }
     Wait::Timeout
+}
+
+/// What a [`read`] got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Read {
+    /// This many bytes landed at the front of the buffer.
+    Bytes(usize),
+    /// Nothing after all (a signal interrupted the read) — just loop.
+    Nothing,
+    /// End of file or an I/O error: the terminal is gone. Quit.
+    Hangup,
+}
+
+/// Take the input [`wait`] reported: a single `read(2)` of whatever is there.
+///
+/// Call it only after `wait` returned [`Wait::Ready`], so it never blocks. A
+/// 0-byte read is end-of-file and an error (`EIO`) is a dead terminal — both are
+/// reported as [`Read::Hangup`], never retried; retrying them in a loop is
+/// exactly how crossterm's own reader pinned a core after a hangup.
+pub fn read(buf: &mut [u8]) -> Read {
+    let Some(fd) = tty_fd() else {
+        return Read::Hangup;
+    };
+    // SAFETY: buf is a valid writable buffer of buf.len() bytes.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    match n {
+        n if n > 0 => Read::Bytes(n as usize),
+        0 => Read::Hangup,
+        _ => match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock => Read::Nothing,
+            _ => Read::Hangup,
+        },
+    }
 }
 
 /// The terminal's size in cells, from the fd we already hold.
@@ -164,7 +196,7 @@ pub fn size() -> Option<(u16, u16)> {
 }
 
 /// Has the controlling terminal hung up? Non-blocking, and never consumes the
-/// input crossterm needs — `poll(2)` only reports readiness, it does not read.
+/// input the run loop needs — `poll(2)` only reports readiness, it does not read.
 ///
 /// **`events` must not be empty.** POSIX says `POLLHUP`/`POLLERR`/`POLLNVAL` are
 /// reported regardless of what was requested, and Linux does exactly that — but
@@ -187,9 +219,8 @@ pub fn hung_up() -> bool {
 /// The thread blocks in `poll(2)` — costing nothing while the terminal is alive —
 /// and wakes the instant it hangs up. It sets the caller's terminate flag so the
 /// run loop shuts down normally (restoring the screen, dropping its children),
-/// then gives it `grace` to do so. If the loop is wedged anyway — inside
-/// crossterm's read loop, or blocked writing to a terminal nobody will ever
-/// drain — it will never observe the flag, so we exit the process outright
+/// then gives it `grace` to do so. If the loop is wedged anyway — say, blocked
+/// writing to a terminal nobody will ever drain — it will never observe the flag, so we exit the process outright
 /// rather than leave a detached, CPU-burning orphan behind.
 pub fn watch_hangup(
     grace: Duration,

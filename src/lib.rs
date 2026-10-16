@@ -12,12 +12,14 @@
 #![allow(clippy::should_implement_trait)]
 
 pub mod app;
+pub mod appearance;
 pub mod clipboard;
 pub mod config;
 pub mod console;
 pub mod fs;
 pub mod image;
 pub mod imgpreview;
+pub mod input;
 pub mod open;
 pub mod ops;
 pub mod preview;

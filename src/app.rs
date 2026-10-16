@@ -632,7 +632,7 @@ impl App {
         let inverted = match self.settings.preview_theme {
             PreviewTheme::Nord => true,
             PreviewTheme::Off => false,
-            PreviewTheme::Auto => bg_is_dark(self.settings.theme.bg),
+            PreviewTheme::Auto => crate::appearance::color_is_dark(self.settings.theme.bg),
         };
         let theme = if inverted { PreviewTheme::Off } else { PreviewTheme::Nord };
         self.settings.preview_theme = theme;
@@ -1285,16 +1285,17 @@ impl App {
                     self.settings.size_format = f;
                 }
             }
-            "theme" => match crate::theme::Theme::by_name(value) {
-                Some(t) => {
-                    self.settings.theme = t;
-                    self.message = Some(format!("theme: {}", value));
+            "theme" | "light_theme" | "dark_theme" => {
+                let known = crate::theme::Theme::by_name(value).is_some() || (name == "theme" && value == "auto");
+                if known {
+                    self.settings.set_field(name, value);
+                    self.message = Some(format!("{}: {} (showing {})", name, value, self.settings.active_theme_name()));
+                } else {
+                    let names = crate::theme::Theme::names();
+                    let names = if name == "theme" { format!("auto, {names}") } else { names.to_string() };
+                    self.message = Some(format!("unknown theme '{}' ({})", value, names))
                 }
-                None => {
-                    self.message =
-                        Some(format!("unknown theme '{}' ({})", value, crate::theme::Theme::names()))
-                }
-            },
+            }
             "preview_theme" => match crate::config::PreviewTheme::from_str(value) {
                 Some(t) => self.settings.preview_theme = t,
                 None => self.message = Some("preview_theme: expected off|nord|auto".to_string()),
@@ -1302,21 +1303,6 @@ impl App {
             other => self.message = Some(format!("set: unknown option {}", other)),
         }
     }
-}
-
-/// Whether a theme background is dark — the rule folio's `--theme auto` uses
-/// (relative luminance below 0.5), so `zI` can tell what `auto` is showing.
-/// Non-RGB backgrounds (the terminal's own) are passed to folio as `none`,
-/// which `auto` treats as light.
-fn bg_is_dark(bg: crossterm::style::Color) -> bool {
-    let crossterm::style::Color::Rgb { r, g, b } = bg else {
-        return false;
-    };
-    let chan = |c: u8| {
-        let c = f64::from(c) / 255.0;
-        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
-    };
-    0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b) < 0.5
 }
 
 #[cfg(test)]
@@ -1463,16 +1449,6 @@ mod tests {
         assert!(msg.contains("failed"), "got message: {:?}", msg);
 
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// `zI` reads what `auto` shows using folio's rule: dark RGB backgrounds
-    /// invert, light ones and the terminal's own background don't.
-    #[test]
-    fn bg_is_dark_matches_folio_auto() {
-        use crossterm::style::Color;
-        assert!(bg_is_dark(Color::Rgb { r: 0x28, g: 0x28, b: 0x28 }));
-        assert!(!bg_is_dark(Color::Rgb { r: 0xfb, g: 0xf1, b: 0xc7 }));
-        assert!(!bg_is_dark(Color::Reset));
     }
 
     /// Long sessions must not grow the caches without bound; the cwd (and other

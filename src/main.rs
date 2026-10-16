@@ -2,13 +2,14 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 
 // Modules live in the library crate (src/lib.rs); the binary just drives them.
 use rustranger::app::{self, App};
-use rustranger::{config, fs, open, tty, ui};
+use rustranger::input::{Input, Parser};
+use rustranger::{appearance, config, fs, open, tty, ui};
 
 /// Internal pending-key sentinel for the `um{key}` chord (awaiting the bookmark
 /// key to delete). Not a typeable key, so it never collides with a real prefix.
@@ -49,10 +50,11 @@ usage: rustranger [PATH] [options]
        rustranger gen-config     write a default config.toml (only if missing)
 
   --choosefile FILE         file-picker mode: write the chosen path and exit
-  --theme NAME              default|gruvbox-dark|gruvbox-light|solarized-dark|
+  --theme NAME              auto|default|gruvbox-dark|gruvbox-light|solarized-dark|
                             solarized-light|nord|dracula|subliminal|gitlab-dark|
                             gitlab-light|everforest-dark|everforest-light|
-                            one-light|ayu-light
+                            one-light|ayu-light  (auto: light_theme/dark_theme
+                            to match the terminal background, switching live)
   --sort KEY                natural|basename|size|mtime|ctime|atime|type|extension|random
   --reverse                 reverse the sort order
   --show-date               show the date column
@@ -254,6 +256,8 @@ fn restore_terminal() -> io::Result<()> {
     // Stop mouse reporting first: leaving it on would make the shell we return to
     // (or a panic'd exit) spew escape sequences on every click.
     out.write_all(MOUSE_OFF.as_bytes())?;
+    // Likewise scheme-change notifications (a no-op if never subscribed).
+    out.write_all(appearance::NOTIFY_OFF)?;
     execute!(out, crossterm::terminal::EnableLineWrap, cursor::Show, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     Ok(())
@@ -303,20 +307,52 @@ fn run(app: &mut App) -> io::Result<()> {
     // Cursor state as the terminal last saw it, so an unchanged frame can skip
     // its write. `None` until the first frame, which therefore always writes.
     let mut last_cursor: Option<Option<(u16, u16)>> = None;
-    // Take over SIGWINCH for our own wait (see `tty::install_resize_wake`). The
-    // priming poll builds crossterm's event source — and registers its handler —
-    // first, so ours is the one that survives.
-    let _ = event::poll(std::time::Duration::ZERO);
+    // Window resizes wake our own wait (see `tty::install_resize_wake`).
     tty::install_resize_wake();
-    // Whether crossterm may still be holding parsed-but-unread events. Normally
-    // the coalescing loop below drains it dry, so the loop can go straight to
-    // sleeping on the fd; it only breaks out early when a key asked to launch a
-    // program or quit, and that is the one case worth an extra poll for.
-    let mut maybe_buffered = false;
+    // Terminal input, decoded by us rather than crossterm so the terminal's
+    // replies (background color, scheme changes) can be told from keystrokes.
+    let mut input = Parser::new();
+    let mut read_buf = [0u8; 1024];
+    // `theme = "auto"`: when to ask the terminal for its background again.
+    let mut look = appearance::Tracker::default();
+    // Ask before the first paint, so it is drawn in the right theme.
+    if app.settings.theme_auto() {
+        query_background(&mut out, &mut look)?;
+        if !settle(&mut input, &mut read_buf, &mut look, appearance::STARTUP_WAIT) {
+            return Ok(());
+        }
+        let bg = input.pending().filter_map(|i| match *i {
+            Input::Background(r, g, b) => Some((r, g, b)),
+            _ => None,
+        });
+        if let Some((r, g, b)) = bg.last() {
+            app.settings.set_dark_background(appearance::rgb_is_dark(r, g, b));
+        }
+    }
+    // The background the screen was last painted with: a theme switch (auto, or
+    // `:set theme`) repaints everything — and re-renders the image preview,
+    // whose fill and colors follow the background.
+    let mut painted_bg = app.settings.theme.bg;
     while !app.quit && !TERMINATE.load(Ordering::Relaxed) {
         if mouse_on != app.settings.mouse_enabled {
             set_mouse(&mut out, app.settings.mouse_enabled)?;
             mouse_on = app.settings.mouse_enabled;
+        }
+        // Subscribe to scheme-change notifications while following the terminal
+        // (also after an external program, which unsubscribes) — and look again
+        // now, as the theme may have changed while we weren't listening.
+        let auto = app.settings.theme_auto();
+        if look.subscribed != auto {
+            out.write_all(if auto { appearance::NOTIFY_ON } else { appearance::NOTIFY_OFF })?;
+            look.subscribed = auto;
+            if auto {
+                query_background(&mut out, &mut look)?;
+            }
+            out.flush()?;
+        }
+        if app.settings.theme.bg != painted_bg {
+            painted_bg = app.settings.theme.bg;
+            needs_full = true;
         }
         app.prepare_view();
         // Our own ioctl on the fd we already hold; crossterm's `size()` reopens
@@ -410,39 +446,73 @@ fn run(app: &mut App) -> io::Result<()> {
         // Collect any detached program that has since exited, so a long session
         // of opening files doesn't accumulate zombies.
         reap(&mut detached);
-        // Wait for input ourselves rather than blocking inside crossterm, whose
-        // event source spins forever on a hung-up terminal (see `tty`). Anything
-        // crossterm still has parsed comes out first; otherwise sleep on the fd.
-        let mut have_event =
-            maybe_buffered && !tty::hung_up() && event::poll(std::time::Duration::ZERO)?;
-        maybe_buffered = false;
-        if !have_event {
+        // Input already decoded (left over when a key launched a program) comes
+        // first; otherwise sleep on the fd until something arrives.
+        if !input.has_pending() {
             match tty::wait(std::time::Duration::from_millis(idle_ms)) {
-                // The terminal is gone: leave through the normal shutdown path
-                // instead of handing crossterm an fd it will spin on.
+                // The terminal is gone: leave through the normal shutdown path.
                 tty::Wait::Hangup => break,
-                // Input is waiting on a live fd, so crossterm can read it.
-                tty::Wait::Ready => have_event = event::poll(std::time::Duration::ZERO)?,
+                tty::Wait::Ready => {
+                    if !fill(&mut input, &mut read_buf) {
+                        break;
+                    }
+                }
                 // A resize just needs the loop to turn: it re-reads the size and
                 // repaints at the top. A timeout is the idle tick.
                 tty::Wait::Resized | tty::Wait::Timeout => {}
             }
         }
-        if have_event {
-            let size = (cur.cols, cur.rows);
-            handle_event(app, event::read()?, &mut pending, &mut count, size);
-            // Coalesce a burst: handle every event already queued before the next
-            // redraw, so fast key-repeat (which backs up behind a slow tmux/SSH
-            // redraw) collapses into ONE frame instead of one frame per key. This
-            // self-paces rendering to whatever the display can keep up with.
-            while !tty::hung_up() && event::poll(std::time::Duration::ZERO)? {
-                handle_event(app, event::read()?, &mut pending, &mut count, size);
+        // Coalesce a burst: handle everything already decoded — and whatever more
+        // is already waiting on the fd — before the next redraw, so fast
+        // key-repeat (which backs up behind a slow tmux/SSH redraw) collapses into
+        // ONE frame instead of one frame per key. This self-paces rendering to
+        // whatever the display can keep up with.
+        let size = (cur.cols, cur.rows);
+        let mut pressed = false;
+        let mut rescheme = false;
+        let mut hung_up = false;
+        // (Skipped on an idle tick: nothing arrived, so there is nothing to drain.)
+        'burst: while input.has_pending() {
+            while let Some(next) = input.next() {
+                match next {
+                    Input::Event(ev) => {
+                        pressed |= matches!(ev, Event::Key(_) | Event::Mouse(_));
+                        handle_event(app, ev, &mut pending, &mut count, size);
+                    }
+                    Input::Background(r, g, b) => {
+                        app.settings.set_dark_background(appearance::rgb_is_dark(r, g, b));
+                    }
+                    Input::SchemeChanged(_) => rescheme = true,
+                    Input::DeviceAttributes => look.answered(),
+                    Input::Reply => {}
+                }
                 // Don't keep swallowing keys once a key has asked to launch an
-                // external program or quit (those keys belong to the next state).
+                // external program or quit (those keys belong to the next state;
+                // they stay queued in `input`).
                 if app.pending_run.is_some() || app.quit {
-                    maybe_buffered = true; // and they may already be parsed
+                    break 'burst;
+                }
+            }
+            match tty::wait(std::time::Duration::ZERO) {
+                tty::Wait::Ready if fill(&mut input, &mut read_buf) => {}
+                tty::Wait::Ready | tty::Wait::Hangup => {
+                    hung_up = true;
                     break;
                 }
+                tty::Wait::Resized | tty::Wait::Timeout => break,
+            }
+        }
+        if hung_up {
+            break;
+        }
+        // `theme = "auto"`: look at the background again — at once when the
+        // terminal says its scheme changed, else on a key press (paced). Never
+        // just before handing the terminal to a program or the shell, which
+        // would receive the answer as typed text.
+        if app.settings.theme_auto() && app.pending_run.is_none() && !app.quit {
+            let now = std::time::Instant::now();
+            if (rescheme && look.notification_due(now)) || (pressed && look.key_due(now)) {
+                query_background(&mut out, &mut look)?;
             }
         }
         if app.jobs_active() {
@@ -452,6 +522,15 @@ fn run(app: &mut App) -> io::Result<()> {
         // Run any external program requested this iteration. A blocking program
         // (editor/pager/shell) suspends the TUI, so force a full repaint after.
         if let Some(req) = app.pending_run.take() {
+            // A query answer still on its way would reach the child as typed
+            // text: wait for it (bounded), and stop scheme notifications.
+            if !settle(&mut input, &mut read_buf, &mut look, appearance::SETTLE_WAIT) {
+                break;
+            }
+            if look.subscribed {
+                let _ = out.write_all(appearance::NOTIFY_OFF);
+                look.subscribed = false;
+            }
             // Remove any preview image so it doesn't linger over the child program.
             let _ = img.clear(&mut out);
             // Hand the mouse back to the child (and to the terminal's own
@@ -478,7 +557,54 @@ fn run(app: &mut App) -> io::Result<()> {
     // Remove any lingering preview image before leaving the alternate screen.
     let _ = img.clear(&mut out);
     out.flush()?;
+    // Don't leave a query answer behind for the shell to print at its prompt.
+    settle(&mut input, &mut read_buf, &mut look, appearance::SETTLE_WAIT);
     Ok(())
+}
+
+/// Ask the terminal for its background color, followed by `DA1` so we can tell
+/// when it has finished answering. Flushes, so the question goes out now.
+fn query_background(out: &mut impl Write, look: &mut appearance::Tracker) -> io::Result<()> {
+    out.write_all(appearance::QUERY_BACKGROUND)?;
+    out.write_all(appearance::QUERY_DEVICE_ATTRIBUTES)?;
+    look.sent(std::time::Instant::now());
+    out.flush()
+}
+
+/// Read whatever the terminal sent into the decoder. `false` on hangup.
+fn fill(input: &mut Parser, buf: &mut [u8]) -> bool {
+    match tty::read(buf) {
+        // A full buffer means more is likely waiting (crossterm's heuristic for
+        // whether a trailing ESC begins a sequence).
+        tty::Read::Bytes(n) => {
+            input.advance(&buf[..n], n == buf.len());
+            true
+        }
+        tty::Read::Nothing => true,
+        tty::Read::Hangup => false,
+    }
+}
+
+/// Wait, up to `limit`, for the answer to an in-flight background query to
+/// arrive in full (its `DA1`). Everything read meanwhile stays queued in
+/// `input`, in order, for the run loop. Returns `false` if the terminal hung up.
+fn settle(input: &mut Parser, buf: &mut [u8], look: &mut appearance::Tracker, limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let now = std::time::Instant::now();
+        if input.pending().any(|i| *i == Input::DeviceAttributes) || !look.in_flight(now) || now >= deadline {
+            return true;
+        }
+        match tty::wait(deadline - now) {
+            tty::Wait::Ready => {
+                if !fill(input, buf) {
+                    return false;
+                }
+            }
+            tty::Wait::Hangup => return false,
+            tty::Wait::Resized | tty::Wait::Timeout => {}
+        }
+    }
 }
 
 /// Wait for any detached child that has exited, dropping it from the list.

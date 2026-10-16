@@ -119,7 +119,7 @@ show_date = true            # show a date column next to the size (current colum
 time_type = "modified"      # modified|created|changed|accessed
 time_format = "date"        # date (YYYY/MM/DD) | datetime (YYYY/MM/DD/HH/MM)
 size_format = "human"       # human (1.5k) | binary (1.5K, 1024-based) | bytes (1536)
-theme = "default"           # see "Color themes" below
+theme = "default"           # or "auto"; see "Color themes" below
 ```
 
 `time_type` follows the Unix timestamps: `modified` (mtime), `changed` (ctime —
@@ -153,6 +153,29 @@ are genuinely light):
 | `gruvbox-dark` · `solarized-dark` · `nord` · `dracula` · `subliminal` · `gitlab-dark` · `everforest-dark` | `gruvbox-light` · `solarized-light` · `one-light` · `ayu-light` · `gitlab-light` · `everforest-light` |
 
 `default` keeps the terminal's own background and uses the classic ANSI colors.
+
+**Following the terminal (light/dark).** `theme = "auto"` picks `light_theme` on a
+light terminal background and `dark_theme` on a dark one, and switches live when
+the background changes — e.g. when the system appearance flips and your terminal
+follows it:
+
+```toml
+[settings]
+theme = "auto"
+light_theme = "gruvbox-light"   # the defaults
+dark_theme = "gruvbox-dark"
+```
+
+rustranger asks the terminal for its background color (`OSC 11`) before the first
+paint, then keeps up with it two ways: terminals that announce scheme changes
+(mode 2031 — Ghostty, kitty, and tmux 3.6 panes, among others) trigger a re-check
+the moment they change; everywhere else the first key press after a pause re-checks
+(at most once a second). Image previews re-render against the new background, so
+folio's `--theme auto` / `preview_theme = "auto"` follow along. There are no helper
+processes or threads involved — the answers arrive through the terminal's input
+stream — and a fixed `theme` sends no queries at all. Needs a terminal that answers
+`OSC 11` (most do; inside tmux, 3.3+ answers for the pane).
+
 Individual roles can be customized on top of the chosen theme with a `[theme]`
 section (values are `#rrggbb`, a basic color name, an ANSI index `0`–`255`, or
 `reset`):
@@ -168,7 +191,8 @@ bg = "#11131a"      # tweak the background
 ```
 
 Roles: `bg`, `fg`, `border`, `title`, `accent`, `dir`, `link`, `exec`, `special`,
-`device`, `broken`, `warning`, `error`, `info`, `progress`.
+`device`, `broken`, `warning`, `error`, `info`, `progress`. With `theme = "auto"`
+they apply on top of whichever of `light_theme`/`dark_theme` is active.
 
 ### In-pane image & document preview
 
@@ -226,7 +250,8 @@ rustranger --set sort=mtime --set theme=ayu-light   # generic form (any setting)
 rustranger --no-date                                # hide the date column
 ```
 
-The active theme is also switchable at runtime with `:set theme <name>`. Run
+The active theme is also switchable at runtime with `:set theme <name>` (or
+`:set theme auto`, `:set light_theme <name>`, `:set dark_theme <name>`). Run
 `rustranger --help` for the full flag list.
 
 Bookmarks persist under `$XDG_DATA_HOME/rustranger/bookmarks`. Tags (`t`) are
